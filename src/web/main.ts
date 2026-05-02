@@ -39,6 +39,7 @@ let collabInterval: any = null;
 let treeExpanded: Set<string> = new Set();
 let realtimeSetup = false;
 let loadingOverlay: HTMLElement | null = null;
+let realtimeDebounce: any = null;
 
 // --- i18n ---
 const t: Record<string, string> = {
@@ -595,29 +596,31 @@ function startCollabPoll() {
     joinPresence(sb, currentUser.id, { email: currentUser.email || '', fullName: currentUser.full_name || '' }, (users) => {
       renderCollabBar(users);
     });
+    const debouncedReload = (prefixes: string[], reloader: () => void) => {
+      prefixes.forEach(p => cacheInvalidate(p));
+      clearTimeout(realtimeDebounce);
+      realtimeDebounce = setTimeout(reloader, 300);
+    };
     subscribeToTable(sb, 'nodes', () => {
-      cacheInvalidate('nodes:');
-      if (currentView === 'files') loadFiles(currentParentId);
-      if (currentView === 'recent') loadRecent();
-      if (currentView === 'archived') loadArchived();
-      if (currentView === 'trash') loadTrash();
-      loadTree();
+      debouncedReload(['nodes:'], () => {
+        if (currentView === 'files') loadFiles(currentParentId);
+        else if (currentView === 'recent') loadRecent();
+        else if (currentView === 'archived') loadArchived();
+        else if (currentView === 'trash') loadTrash();
+        loadTree();
+      });
     });
     subscribeToTable(sb, 'products', () => {
-      cacheInvalidate('products:');
-      if (currentView === 'products') loadProducts();
+      debouncedReload(['products:'], () => { if (currentView === 'products') loadProducts(); });
     });
     subscribeToTable(sb, 'share_links', () => {
-      cacheInvalidate('share_links:');
-      if (currentView === 'shared') loadShared();
+      debouncedReload(['share_links:'], () => { if (currentView === 'shared') loadShared(); });
     });
     subscribeToTable(sb, 'audit_log', () => {
-      cacheInvalidate('audit_log:');
-      if (currentView === 'audit') loadAudit();
+      debouncedReload(['audit_log:'], () => { if (currentView === 'audit') loadAudit(); });
     });
     subscribeToTable(sb, 'data_blocks', () => {
-      cacheInvalidate('data_blocks:');
-      if (currentView === 'blocks') loadBlocks();
+      debouncedReload(['data_blocks:'], () => { if (currentView === 'blocks') loadBlocks(); });
     });
   }
 }

@@ -30,8 +30,10 @@ export function subscribeToTable(
   };
   if (filter) channelConfig.filter = filter;
 
+  const channelName = `vault-${table}-${filter || 'all'}-${Date.now()}`;
+
   const channel = sb
-    .channel(`${table}-changes`)
+    .channel(channelName)
     .on('postgres_changes', channelConfig, (payload: any) => {
       const sub = subscriptions.get(key);
       if (sub) sub.handlers.forEach(h => h(payload));

@@ -49,6 +49,9 @@ export async function dedupFetch<T>(key: string, fetcher: () => Promise<T>, ttl:
     cacheSet(key, data, ttl);
     inflight.delete(key);
     return data;
+  }).catch(err => {
+    inflight.delete(key);
+    throw err;
   });
   inflight.set(key, promise);
   return promise;
