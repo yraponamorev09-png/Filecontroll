@@ -25,10 +25,14 @@ export function cacheInvalidate(prefix: string): void {
   for (const key of cache.keys()) {
     if (key.startsWith(prefix)) cache.delete(key);
   }
+  for (const key of inflight.keys()) {
+    if (key.startsWith(prefix)) inflight.delete(key);
+  }
 }
 
 export function cacheClear(): void {
   cache.clear();
+  inflight.clear();
 }
 
 export function cacheSize(): number {
