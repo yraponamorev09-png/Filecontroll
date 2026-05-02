@@ -9,6 +9,8 @@ import {
 } from '../core/index.js';
 import type { Permission } from '../types/index.js';
 import { AuthService } from './auth.js';
+import { subscribeToTable, unsubscribeAll, joinPresence, leavePresence } from '../utils/realtime.js';
+import { cacheGet, cacheSet, cacheInvalidate, cacheClear, dedupFetch } from '../utils/cache.js';
 
 // --- Supabase client (uses .env, auth is handled by Supabase Auth) ---
 const SUPABASE_URL = (import.meta as any).env?.VITE_SUPABASE_URL ?? '';
@@ -35,6 +37,8 @@ let searchTimeout: any = null;
 let ctxMenuEl: HTMLElement | null = null;
 let collabInterval: any = null;
 let treeExpanded: Set<string> = new Set();
+let realtimeSetup = false;
+let loadingOverlay: HTMLElement | null = null;
 
 // --- i18n ---
 const t: Record<string, string> = {
@@ -110,7 +114,7 @@ const t: Record<string, string> = {
   run_integrity:'Проверить файл',integrity_results:'Результаты проверки',
   all_valid:'Все файлы целы',integrity_issues:'Обнаружены проблемы',
   restore_confirm:'Восстановить из этой резервной копии? Текущие данные будут перезаписаны.',
-  backup_created:'Бэкап создан',backup_verified:'Бэкап проверен',
+  backup_created:'Бэкап создан',backup_verified:'Бэкап проверен',verify:'Проверка',
   backup_restored:'Бэкап восстановлен',integrity_checked:'Проверка завершена',
   login:'Войти',register:'Регистрация',email:'Email',
   confirm_password:'Подтвердите пароль',full_name:'Полное имя',
@@ -133,6 +137,59 @@ const t: Record<string, string> = {
 
 const LIFECYCLE_STAGES = ['concept','design','engineering','production','eol'];
 const DOCUMENT_TYPES = ['specification','drawing','report','certificate','manual'];
+
+// --- Loading overlay ---
+function showLoading(msg?: string) {
+  if (loadingOverlay) return;
+  loadingOverlay = document.createElement('div');
+  loadingOverlay.className = 'loading-overlay';
+  loadingOverlay.innerHTML = `<div class="loading-spinner"></div>${msg ? `<div class="loading-msg">${msg}</div>` : ''}`;
+  document.body.appendChild(loadingOverlay);
+}
+function hideLoading() {
+  if (loadingOverlay) { loadingOverlay.remove(); loadingOverlay = null; }
+}
+
+// --- Optimistic UI helpers ---
+function optimisticInsertRow(listEl: HTMLElement, html: string, position: 'start' | 'end' = 'start') {
+  const container = listEl.querySelector('.file-list') || listEl;
+  const temp = document.createElement('div');
+  temp.innerHTML = html;
+  const row = temp.firstElementChild as HTMLElement;
+  if (!row) return;
+  row.style.opacity = '0.5';
+  row.style.transition = 'opacity 0.3s';
+  if (position === 'start') container.prepend(row);
+  else container.appendChild(row);
+  requestAnimationFrame(() => { row.style.opacity = '1'; });
+  bindFileRows();
+}
+
+function optimisticRemoveRow(nodeId: string) {
+  const row = document.querySelector(`.file-row[data-id="${nodeId}"]`) as HTMLElement;
+  if (row) {
+    row.style.transition = 'opacity 0.2s, transform 0.2s';
+    row.style.opacity = '0';
+    row.style.transform = 'translateX(-20px)';
+    setTimeout(() => row.remove(), 200);
+  }
+}
+
+function optimisticUpdateRow(nodeId: string, updates: Record<string, string>) {
+  const row = document.querySelector(`.file-row[data-id="${nodeId}"]`) as HTMLElement;
+  if (!row) return;
+  if (updates.name) {
+    const nameEl = row.querySelector('.fr-name');
+    if (nameEl) nameEl.textContent = updates.name;
+  }
+  if (updates.size) {
+    const sizeEl = row.querySelector('.fr-size');
+    if (sizeEl) sizeEl.textContent = updates.size;
+  }
+  row.style.transition = 'background 0.3s';
+  row.style.background = 'var(--accent-bg)';
+  setTimeout(() => { row.style.background = ''; }, 600);
+}
 
 // --- Init ---
 async function init() {
@@ -283,6 +340,10 @@ function showConnectionSetup() {
 };
 
 (window as any).handleLogout = async () => {
+  unsubscribeAll(sb);
+  leavePresence(sb);
+  realtimeSetup = false;
+  cacheClear();
   await auth.signOut();
   currentUser = null;
   showLoginScreen();
@@ -413,19 +474,23 @@ function loadView(view: string) {
   if (pathStack.length>1) { pathStack.pop(); currentParentId=pathStack[pathStack.length-1].id; loadFiles(currentParentId); (document.getElementById('btn-back') as HTMLElement).style.display=pathStack.length>1?'flex':'none'; }
 };
 
-// --- Tree ---
+// --- Tree (lazy loading) ---
 async function loadTree() {
-  const {data} = await sb.from('nodes').select('*').eq('is_deleted',false).eq('is_archived',false).order('node_type').order('name');
-  const nodes = data||[];
+  const cacheKey = 'nodes:tree';
+  const nodes = await dedupFetch(cacheKey, async () => {
+    const { data } = await sb.from('nodes').select('*').eq('is_deleted', false).eq('is_archived', false).order('node_type').order('name');
+    return data || [];
+  }, 15000);
   const byParent: Record<string,any[]> = {};
-  nodes.forEach(n => { const pid=n.parent_id||'__root__'; if(!byParent[pid])byParent[pid]=[]; byParent[pid].push(n); });
+  nodes.forEach((n: any) => { const pid=n.parent_id||'__root__'; if(!byParent[pid])byParent[pid]=[]; byParent[pid].push(n); });
   document.getElementById('tree-body')!.innerHTML = renderTreeLevel(byParent,'__root__',0);
   bindTreeItems();
 }
 function renderTreeLevel(byParent: Record<string,any[]>,parentId:string,depth:number): string {
   return (byParent[parentId]||[]).filter(n=>n.node_type==='folder').map(n => {
     const isOpen=treeExpanded.has(n.id);
-    return `<div class="tree-item${currentParentId===n.id?' active':''}" data-id="${n.id}"><span class="ti-arrow${isOpen?' open':''}">&#9654;</span><span class="ti-ic">&#128193;</span>${n.name}</div>${isOpen?`<div class="tree-children">${renderTreeLevel(byParent,n.id,depth+1)}</div>`:''}`;
+    const hasChildren = !!byParent[n.id]?.filter((c: any) => c.node_type === 'folder').length;
+    return `<div class="tree-item${currentParentId===n.id?' active':''}" data-id="${n.id}"><span class="ti-arrow${isOpen?' open':''}">${hasChildren ? '&#9654;' : ''}</span><span class="ti-ic">&#128193;</span>${n.name}</div>${isOpen?`<div class="tree-children">${renderTreeLevel(byParent,n.id,depth+1)}</div>`:''}`;
   }).join('');
 }
 function bindTreeItems() {
@@ -499,7 +564,7 @@ function startRename(nodeId:string) {
   const nameEl=row.querySelector('.fr-name')!;const oldName=nameEl.textContent!;
   const input=document.createElement('input');input.className='rename-input';input.value=oldName;
   nameEl.replaceWith(input);input.focus();input.select();
-  const finish=async()=>{const newName=input.value.trim()||oldName;if(newName!==oldName){await sb.from('nodes').update({name:newName,updated_at:new Date().toISOString()}).eq('id',nodeId);await sb.from('audit_log').insert({id:uuidv4(),user_id:currentUser.id,node_id:nodeId,action:'node_rename',details:{old_name:oldName,new_name:newName}});toast(`${t.rename}: ${newName}`,'ok');loadTree();}loadView(currentView);};
+  const finish=async()=>{const newName=input.value.trim()||oldName;if(newName!==oldName){optimisticUpdateRow(nodeId,{name:newName});await sb.from('nodes').update({name:newName,updated_at:new Date().toISOString()}).eq('id',nodeId);await sb.from('audit_log').insert({id:uuidv4(),user_id:currentUser.id,node_id:nodeId,action:'node_rename',details:{old_name:oldName,new_name:newName}});cacheInvalidate('nodes:');toast(`${t.rename}: ${newName}`,'ok');loadTree();}loadView(currentView);};
   input.addEventListener('blur',finish);input.addEventListener('keydown',(e)=>{if(e.key==='Enter')input.blur();if(e.key==='Escape'){input.value=oldName;input.blur();}});
 }
 (window as any).startRename=startRename;
@@ -523,19 +588,59 @@ async function previewFile(nodeId:string) {
 function closePreview(){const p=document.getElementById('preview-panel');if(p)p.remove();}
 (window as any).closePreview=closePreview;(window as any).previewFile=previewFile;
 
-// --- Collaboration ---
-function startCollabPoll(){collabInterval=setInterval(updateCollabBar,5000);updateCollabBar();}
-async function updateCollabBar(){const bar=document.getElementById('collab-bar')!;if(currentView!=='files'&&currentView!=='products'){bar.style.display='none';return;}const{data}=await sb.from('collab_sessions').select('*, user_profiles(email,full_name)').gt('last_active_at',new Date(Date.now()-60000).toISOString());const sessions=data||[];if(sessions.length===0){bar.style.display='none';return;}bar.style.display='flex';const users=[...new Map(sessions.map((s:any)=>[s.user_id,s])).values()];bar.innerHTML=`<div class="collab-dot"></div><span>${t.online}: ${users.length}</span><div style="display:flex;margin-left:4px">${users.map((s:any)=>`<div class="collab-user" title="${esc(s.user_profiles?.full_name||s.user_profiles?.email||'?')}">${esc((s.user_profiles?.full_name||s.user_profiles?.email||'?')[0].toUpperCase())}</div>`).join('')}</div>`;}
+// --- Collaboration (Realtime Presence) ---
+function startCollabPoll() {
+  if (!realtimeSetup && currentUser) {
+    realtimeSetup = true;
+    joinPresence(sb, currentUser.id, { email: currentUser.email || '', fullName: currentUser.full_name || '' }, (users) => {
+      renderCollabBar(users);
+    });
+    subscribeToTable(sb, 'nodes', () => {
+      cacheInvalidate('nodes:');
+      if (currentView === 'files') loadFiles(currentParentId);
+      if (currentView === 'recent') loadRecent();
+      if (currentView === 'archived') loadArchived();
+      if (currentView === 'trash') loadTrash();
+      loadTree();
+    });
+    subscribeToTable(sb, 'products', () => {
+      cacheInvalidate('products:');
+      if (currentView === 'products') loadProducts();
+    });
+    subscribeToTable(sb, 'share_links', () => {
+      cacheInvalidate('share_links:');
+      if (currentView === 'shared') loadShared();
+    });
+    subscribeToTable(sb, 'audit_log', () => {
+      cacheInvalidate('audit_log:');
+      if (currentView === 'audit') loadAudit();
+    });
+    subscribeToTable(sb, 'data_blocks', () => {
+      cacheInvalidate('data_blocks:');
+      if (currentView === 'blocks') loadBlocks();
+    });
+  }
+}
+
+function renderCollabBar(users: any[]) {
+  const bar = document.getElementById('collab-bar')!;
+  if (currentView !== 'files' && currentView !== 'products') { bar.style.display = 'none'; return; }
+  if (users.length === 0) { bar.style.display = 'none'; return; }
+  bar.style.display = 'flex';
+  bar.innerHTML = `<div class="collab-dot"></div><span>${t.online}: ${users.length}</span><div style="display:flex;margin-left:4px">${users.map((u: any) => `<div class="collab-user" title="${esc(u.full_name || u.email || '?')}">${esc((u.full_name || u.email || '?')[0].toUpperCase())}</div>`).join('')}</div>`;
+}
 
 // ==================== PLM: PRODUCTS ====================
 
 async function loadProducts() {
   const c=document.getElementById('content')!;
   document.getElementById('bc')!.innerHTML=`<a>${t.products}</a>`;
-  const {data,error}=await sb.from('products').select('*').order('code');
-  if(error){c.innerHTML=errMsg(error.message);return;}
-  const products=data||[];
-  const stageCounts: Record<string,number>={};products.forEach(p=>{stageCounts[p.lifecycle_stage]=(stageCounts[p.lifecycle_stage]||0)+1;});
+  const products = await dedupFetch('products:list', async () => {
+    const { data, error } = await sb.from('products').select('*').order('code');
+    if (error) throw new Error(error.message);
+    return data || [];
+  });
+  const stageCounts: Record<string,number>={};products.forEach((p: any)=>{stageCounts[p.lifecycle_stage]=(stageCounts[p.lifecycle_stage]||0)+1;});
   c.innerHTML=`
     <div class="lifecycle-bar">${LIFECYCLE_STAGES.map(s=>`<div class="lifecycle-stage" onclick="filterByStage('${s}')">${t[s as keyof typeof t]||s} <span style="opacity:0.6">${stageCounts[s]||0}</span></div>`).join('')}</div>
     <div class="stats">${LIFECYCLE_STAGES.map(s=>`<div class="stat-card"><div class="stat-val">${stageCounts[s]||0}</div><div class="stat-lbl">${t[s as keyof typeof t]||s}</div></div>`).join('')}</div>
@@ -611,6 +716,7 @@ async function openProductDetail(productId: string) {
   if(newIdx===idx)return;
   await sb.from('products').update({lifecycle_stage:LIFECYCLE_STAGES[newIdx],updated_at:new Date().toISOString()}).eq('id',productId);
   await sb.from('audit_log').insert({id:uuidv4(),user_id:currentUser.id,node_id:null,action:'lifecycle_change',details:{product_id:productId,from:product.lifecycle_stage,to:LIFECYCLE_STAGES[newIdx]}});
+  cacheInvalidate('products:');
   toast(`${t.lifecycle}: ${t[LIFECYCLE_STAGES[newIdx] as keyof typeof t]}`,'ok');
   openProductDetail(productId);loadProducts();
 };
@@ -634,7 +740,7 @@ async function openProductDetail(productId: string) {
   const stage=(document.getElementById('m-pstage') as HTMLSelectElement).value;
   if(!code||!name){toast('Укажите код и название','err');return;}
   const{error}=await sb.from('products').insert({code,name,description:desc,lifecycle_stage:stage,owner_id:currentUser.id,status:'draft'});
-  (window as any).closeModal();if(error)toast('Ошибка: '+error.message,'err');else{toast(t.saved,'ok');loadProducts();}
+  (window as any).closeModal();if(error)toast('Ошибка: '+error.message,'err');else{cacheInvalidate('products:');toast(t.saved,'ok');loadProducts();}
 };
 
 (window as any).startWorkflow=async(productId:string)=>{
@@ -672,20 +778,25 @@ async function openProductDetail(productId: string) {
 
 async function loadFiles(parentId:string|null) {
   const c=document.getElementById('content')!;updateBreadcrumb();
-  let q=sb.from('nodes').select('*').eq('is_deleted',false).eq('is_archived',false).order('node_type').order('name');
-  if(parentId)q=q.eq('parent_id',parentId);else q=q.is('parent_id',null);
-  const{data,error}=await q;if(error){c.innerHTML=errMsg(error.message);return;}
-  const nodes=data||[];
-  const sf=nodes.filter(n=>n.node_type==='folder').length;
-  const sfi=nodes.filter(n=>n.node_type==='file').length;
+  const cacheKey = `nodes:files:${parentId||'root'}`;
+  const nodes = await dedupFetch(cacheKey, async () => {
+    let q=sb.from('nodes').select('*').eq('is_deleted',false).eq('is_archived',false).order('node_type').order('name');
+    if(parentId)q=q.eq('parent_id',parentId);else q=q.is('parent_id',null);
+    const{data,error}=await q;if(error)throw new Error(error.message);
+    return data||[];
+  });
+  const sf=nodes.filter((n: any)=>n.node_type==='folder').length;
+  const sfi=nodes.filter((n: any)=>n.node_type==='file').length;
   const ss=nodes.reduce((a:number,n:any)=>a+(n.node_type==='file'?n.size:0),0);
   c.innerHTML=`
     <div class="upload-zone" id="drop-zone"><div class="uz-icon">&#11014;</div><div class="uz-title">${t.upload_title}</div><div class="uz-desc">${t.upload_desc}</div></div>
     <div id="upload-progress"></div>
     <div class="stats"><div class="stat-card"><div class="stat-val">${sf}</div><div class="stat-lbl">${t.folders}</div></div><div class="stat-card"><div class="stat-val">${sfi}</div><div class="stat-lbl">${t.files}</div></div><div class="stat-card"><div class="stat-val">${fmtSize(ss)}</div><div class="stat-lbl">${t.total_size}</div></div></div>
     ${nodes.length>0?`<div class="file-list-header"><div class="fh-name">${t.name}</div><div class="fh-size">${t.size}</div><div class="fh-date">${t.date}</div></div>`:''}
-    <div class="file-list">${nodes.length===0?`<div class="empty"><div class="empty-ic">&#128193;</div><div class="empty-t">${t.no_files}</div></div>`:nodes.map(n=>fileRow(n)).join('')}</div>`;
+    <div class="file-list" id="file-list-virtual">${nodes.length===0?`<div class="empty"><div class="empty-ic">&#128193;</div><div class="empty-t">${t.no_files}</div></div>`:renderVirtualChunk(nodes,0)}</div>
+    <div id="virtual-sentinel" style="height:1px"></div>`;
   setupDropZone();bindFileRows();
+  if (nodes.length > 50) setupVirtualScroll(nodes);
 }
 
 function fileRow(n:any):string {
@@ -695,6 +806,38 @@ function fileRow(n:any):string {
   if(n.is_archived)badges.push(`<span class="badge badge-arch">${t.archived}</span>`);
   if(n.node_type==='file')badges.push(`<span class="badge badge-enc">${t.encrypted}</span>`);
   return `<div class="file-row" data-id="${n.id}" data-type="${n.node_type}"><div class="fr-icon ${icCls}">${ic}</div><div class="fr-name">${esc(n.name)}</div><div class="fr-badges">${badges.join('')}</div><div class="fr-size">${n.node_type==='file'?fmtSize(n.size):'--'}</div><div class="fr-date">${fmtDate(n.updated_at)}</div><div class="fr-actions">${n.node_type==='file'?`<button onclick="event.stopPropagation();previewFile('${n.id}')" title="${t.preview}">&#128065;</button><button onclick="event.stopPropagation();downloadFile('${n.id}')" title="${t.download}">&#11015;</button>`:''}<button onclick="event.stopPropagation();startRename('${n.id}')" title="${t.rename}">&#9998;</button><button class="del" onclick="event.stopPropagation();deleteFile('${n.id}')" title="${t.delete}">&#128465;</button></div></div>`;
+}
+
+// --- Virtual scrolling ---
+const VIRTUAL_CHUNK = 50;
+let virtualAllNodes: any[] = [];
+let virtualRendered = 0;
+let virtualObserver: IntersectionObserver | null = null;
+
+function renderVirtualChunk(nodes: any[], startIdx: number): string {
+  const end = Math.min(startIdx + VIRTUAL_CHUNK, nodes.length);
+  let html = '';
+  for (let i = startIdx; i < end; i++) html += fileRow(nodes[i]);
+  virtualRendered = end;
+  return html;
+}
+
+function setupVirtualScroll(nodes: any[]) {
+  virtualAllNodes = nodes;
+  virtualRendered = VIRTUAL_CHUNK;
+  if (virtualObserver) virtualObserver.disconnect();
+  virtualObserver = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (entry.isIntersecting && virtualRendered < virtualAllNodes.length) {
+        const listEl = document.getElementById('file-list-virtual');
+        if (!listEl) return;
+        listEl.insertAdjacentHTML('beforeend', renderVirtualChunk(virtualAllNodes, virtualRendered));
+        bindFileRows();
+      }
+    }
+  }, { rootMargin: '200px' });
+  const sentinel = document.getElementById('virtual-sentinel');
+  if (sentinel) virtualObserver.observe(sentinel);
 }
 
 function bindFileRows() {
@@ -707,11 +850,11 @@ function bindFileRows() {
 // --- Upload ---
 function setupDropZone(){const zone=document.getElementById('drop-zone'),input=document.getElementById('file-input') as HTMLInputElement;if(!zone)return;zone.addEventListener('click',()=>input.click());zone.addEventListener('dragover',e=>{e.preventDefault();zone.classList.add('dragover');});zone.addEventListener('dragleave',()=>zone.classList.remove('dragover'));zone.addEventListener('drop',e=>{e.preventDefault();zone.classList.remove('dragover');handleFiles(e.dataTransfer!.files);});input.onchange=()=>{if(input.files)handleFiles(input.files);input.value='';};}
 async function handleFiles(fileList:FileList){for(const file of fileList)uploadQueue.push({file,progress:0});if(!isUploading)processUploadQueue();}
-async function processUploadQueue(){if(uploadQueue.length===0){isUploading=false;return;}isUploading=true;renderUploadProgress();while(uploadQueue.length>0){const item=uploadQueue[0];try{await uploadFileWithProgress(item);toast(`${t.upload_complete}: ${item.file.name}`,'ok');}catch(e:any){toast(`${t.upload_failed}: ${item.file.name}`,'err');}uploadQueue.shift();renderUploadProgress();}isUploading=false;loadFiles(currentParentId);loadTree();}
+async function processUploadQueue(){if(uploadQueue.length===0){isUploading=false;return;}isUploading=true;renderUploadProgress();while(uploadQueue.length>0){const item=uploadQueue[0];try{await uploadFileWithProgress(item);toast(`${t.upload_complete}: ${item.file.name}`,'ok');}catch(e:any){toast(`${t.upload_failed}: ${item.file.name}`,'err');}uploadQueue.shift();renderUploadProgress();}isUploading=false;cacheInvalidate('nodes:');loadFiles(currentParentId);loadTree();}
 function renderUploadProgress(){const el=document.getElementById('upload-progress');if(!el)return;if(uploadQueue.length===0){el.innerHTML='';return;}el.innerHTML=uploadQueue.map(item=>`<div style="background:var(--bg-1);border:1px solid var(--border);border-radius:var(--r);padding:4px 10px;margin-bottom:3px;display:flex;align-items:center;gap:6px"><span style="font-size:11px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${item.file.name}</span><div class="progress-bar" style="width:60px"><div class="progress-fill" style="width:${item.progress}%"></div></div><span style="font-size:10px;color:var(--accent);width:28px;text-align:right">${item.progress}%</span></div>`).join('');}
 async function uploadFileWithProgress(item:{file:File;progress:number}){if(!currentUser)throw new Error('No user');const file=item.file;const buf=await file.arrayBuffer();const size=buf.byteLength;const id=uuidv4();item.progress=20;renderUploadProgress();const{error:nodeErr}=await sb.from('nodes').insert({id,parent_id:currentParentId,owner_id:currentUser.id,name:file.name,node_type:'file',path:`/${file.name}`,mime_type:file.type||'application/octet-stream',size});if(nodeErr)throw nodeErr;item.progress=40;renderUploadProgress();const hashBuf=await crypto.subtle.digest('SHA-256',buf);const hash=Array.from(new Uint8Array(hashBuf)).map(b=>b.toString(16).padStart(2,'0')).join('');item.progress=60;renderUploadProgress();const vid=uuidv4();await sb.from('file_versions').insert({id:vid,node_id:id,version_number:1,total_size:size,content_hash:hash,encrypted_key:new Uint8Array(32),key_nonce:new Uint8Array(24),is_current:true,is_compressed:false,created_by:currentUser.id,comment:'Загружен'});item.progress=75;renderUploadProgress();const bid=uuidv4();await sb.from('data_blocks').insert({id:bid,content_hash:hash,encrypted_hash:hash,size,encrypted_size:size+16,physical_path:`/vault/blocks/${hash.substring(0,2)}/${hash}`,compression:'none',ref_count:1});await sb.from('file_version_blocks').insert({id:uuidv4(),version_id:vid,block_id:bid,block_index:0,block_offset:0});item.progress=90;renderUploadProgress();await sb.from('audit_log').insert({id:uuidv4(),user_id:currentUser.id,node_id:id,action:'version_create',details:{version_number:1,size}});item.progress=100;renderUploadProgress();}
 (window as any).triggerUpload=()=>{(document.getElementById('file-input') as HTMLInputElement).click();};
-(window as any).createFolder=async()=>{if(!currentUser)return;const name='Новая папка';const id=uuidv4();await sb.from('nodes').insert({id,parent_id:currentParentId,owner_id:currentUser.id,name,node_type:'folder',path:`/${name}`,size:0});toast(t.folder_created,'ok');loadFiles(currentParentId);loadTree();};
+(window as any).createFolder=async()=>{if(!currentUser)return;const name='Новая папка';const id=uuidv4();const tempNode={id,parent_id:currentParentId,owner_id:currentUser.id,name,node_type:'folder',path:`/${name}`,size:0,mime_type:null,is_archived:false,is_deleted:false,updated_at:new Date().toISOString(),created_at:new Date().toISOString()};optimisticInsertRow(document.getElementById('content')!,fileRow(tempNode));await sb.from('nodes').insert({id,parent_id:currentParentId,owner_id:currentUser.id,name,node_type:'folder',path:`/${name}`,size:0});cacheInvalidate('nodes:');toast(t.folder_created,'ok');loadTree();};
 
 // --- Breadcrumb ---
 function updateBreadcrumb(){document.getElementById('bc')!.innerHTML=pathStack.map((p,i)=>`<a onclick="navTo(${i})">${p.name}</a>${i<pathStack.length-1?'<span class="sep">/</span>':''}`).join('');}
@@ -752,8 +895,8 @@ async function openDetail(nodeId:string) {
 }
 
 (window as any).addComment=async(versionId:string)=>{const input=document.getElementById('new-comment') as HTMLInputElement;const comment=input.value.trim();if(!comment)return;await sb.from('version_comments').insert({id:uuidv4(),version_id:versionId,user_id:currentUser.id,comment});toast(t.comment,'ok');if(selectedNodeId)openDetail(selectedNodeId);};
-(window as any).deleteFile=async(nodeId:string)=>{if(!confirm(t.delete_confirm))return;try{await softDeleteNode(nodeId,currentUser.id);toast(t.delete,'ok');document.getElementById('detail')!.style.display='none';loadView(currentView);loadTree();}catch(e:any){toast(e.message,'err');}};
-(window as any).archiveFile=async(nodeId:string)=>{try{await sb.from('nodes').update({is_archived:true,updated_at:new Date().toISOString()}).eq('id',nodeId);await sb.from('audit_log').insert({id:uuidv4(),user_id:currentUser.id,node_id:nodeId,action:'archive_files',details:{}});toast(t.archive_btn,'ok');document.getElementById('detail')!.style.display='none';loadView(currentView);loadTree();}catch(e:any){toast(e.message,'err');}};
+(window as any).deleteFile=async(nodeId:string)=>{if(!confirm(t.delete_confirm))return;optimisticRemoveRow(nodeId);try{await softDeleteNode(nodeId,currentUser.id);cacheInvalidate('nodes:');toast(t.delete,'ok');document.getElementById('detail')!.style.display='none';loadTree();}catch(e:any){toast(e.message,'err');loadView(currentView);}};
+(window as any).archiveFile=async(nodeId:string)=>{optimisticRemoveRow(nodeId);try{await sb.from('nodes').update({is_archived:true,updated_at:new Date().toISOString()}).eq('id',nodeId);await sb.from('audit_log').insert({id:uuidv4(),user_id:currentUser.id,node_id:nodeId,action:'archive_files',details:{}});cacheInvalidate('nodes:');toast(t.archive_btn,'ok');document.getElementById('detail')!.style.display='none';loadTree();}catch(e:any){toast(e.message,'err');loadView(currentView);}};
 (window as any).unarchiveFileAction=async(nodeId:string)=>{try{await unarchiveFile(nodeId);toast(t.unarchive_btn,'ok');openDetail(nodeId);}catch(e:any){toast(e.message,'err');}};
 (window as any).downloadFile=async(nodeId:string)=>{const{data:node}=await sb.from('nodes').select('name,mime_type').eq('id',nodeId).maybeSingle();if(!node)return;const blob=new Blob([`Vault PLM placeholder: ${node.name}`],{type:node.mime_type||'application/octet-stream'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=node.name;a.click();URL.revokeObjectURL(url);};
 (window as any).lockFile=async(nodeId:string)=>{try{const result=await acquireFileLock(nodeId,currentUser.id,30000);if(result.acquired)toast(t.lock_acquired,'ok');else toast(t.lock_failed,'err');}catch(e:any){toast(e.message,'err');}};
@@ -770,18 +913,18 @@ let shareNodeId:string|null=null;
 (window as any).revokeShare=async(linkId:string,nodeId:string)=>{try{await revokeShareLink(currentUser.id,linkId);toast(t.revoke,'ok');openDetail(nodeId);}catch(e:any){toast(e.message,'err');}};
 
 // --- Trash ---
-async function loadTrash(){const c=document.getElementById('content')!;const{data,error}=await sb.from('nodes').select('*').eq('is_deleted',true).order('deleted_at',{ascending:false});if(error){c.innerHTML=errMsg(error.message);return;}updateBreadcrumbView(t.trash);const nodes=data||[];c.innerHTML=nodes.length===0?`<div class="empty"><div class="empty-ic">&#128465;</div><div class="empty-t">${t.no_trash}</div></div>`:`<div class="file-list">${nodes.map(n=>`<div class="file-row" data-id="${n.id}" data-type="${n.node_type}"><div class="fr-icon file">${n.node_type==='folder'?'&#128193;':'&#128196;'}</div><div class="fr-name">${esc(n.name)}</div><div class="fr-size">${fmtSize(n.size)}</div><div class="fr-date">${fmtDate(n.deleted_at)}</div><div class="fr-actions"><button onclick="event.stopPropagation();restoreFromTrash('${n.id}')">${t.restore}</button></div></div>`).join('')}</div>`;}
-(window as any).restoreFromTrash=async(nodeId:string)=>{await sb.from('nodes').update({is_deleted:false,deleted_at:null,updated_at:new Date().toISOString()}).eq('id',nodeId);toast(t.restore,'ok');loadTrash();loadTree();};
+async function loadTrash(){const c=document.getElementById('content')!;const nodes=await dedupFetch('nodes:trash',async()=>{const{data,error}=await sb.from('nodes').select('*').eq('is_deleted',true).order('deleted_at',{ascending:false});if(error)throw new Error(error.message);return data||[];});updateBreadcrumbView(t.trash);c.innerHTML=nodes.length===0?`<div class="empty"><div class="empty-ic">&#128465;</div><div class="empty-t">${t.no_trash}</div></div>`:`<div class="file-list">${nodes.map((n: any)=>`<div class="file-row" data-id="${n.id}" data-type="${n.node_type}"><div class="fr-icon file">${n.node_type==='folder'?'&#128193;':'&#128196;'}</div><div class="fr-name">${esc(n.name)}</div><div class="fr-size">${fmtSize(n.size)}</div><div class="fr-date">${fmtDate(n.deleted_at)}</div><div class="fr-actions"><button onclick="event.stopPropagation();restoreFromTrash('${n.id}')">${t.restore}</button></div></div>`).join('')}</div>`;}
+(window as any).restoreFromTrash=async(nodeId:string)=>{await sb.from('nodes').update({is_deleted:false,deleted_at:null,updated_at:new Date().toISOString()}).eq('id',nodeId);cacheInvalidate('nodes:');toast(t.restore,'ok');loadTrash();loadTree();};
 (window as any).purgeTrash=async()=>{try{const count=await purgeDeletedNodes(0);toast(`${t.purge_done}: ${count}`,'ok');loadTrash();}catch(e:any){toast(e.message,'err');}};
 
 // --- Recent ---
-async function loadRecent(){const c=document.getElementById('content')!;const{data,error}=await sb.from('nodes').select('*').eq('is_deleted',false).eq('is_archived',false).eq('node_type','file').order('updated_at',{ascending:false}).limit(20);if(error){c.innerHTML=errMsg(error.message);return;}updateBreadcrumbView(t.recent);c.innerHTML=`<div class="file-list-header"><div class="fh-name">${t.name}</div><div class="fh-size">${t.size}</div><div class="fh-date">${t.date}</div></div><div class="file-list">${(data||[]).map(n=>fileRow(n)).join('')}</div>`;bindFileRows();}
+async function loadRecent(){const c=document.getElementById('content')!;const data=await dedupFetch('nodes:recent',async()=>{const{data,error}=await sb.from('nodes').select('*').eq('is_deleted',false).eq('is_archived',false).eq('node_type','file').order('updated_at',{ascending:false}).limit(20);if(error)throw new Error(error.message);return data||[];});updateBreadcrumbView(t.recent);c.innerHTML=`<div class="file-list-header"><div class="fh-name">${t.name}</div><div class="fh-size">${t.size}</div><div class="fh-date">${t.date}</div></div><div class="file-list">${(data||[]).map((n: any)=>fileRow(n)).join('')}</div>`;bindFileRows();}
 
 // --- Shared ---
-async function loadShared(){const c=document.getElementById('content')!;const{data,error}=await sb.from('share_links').select('*, nodes(name)').order('created_at',{ascending:false});if(error){c.innerHTML=errMsg(error.message);return;}updateBreadcrumbView(t.shared);c.innerHTML=(data||[]).length===0?`<div class="empty"><div class="empty-ic">&#128279;</div><div class="empty-t">${t.no_links}</div></div>`:`<table class="tbl"><thead><tr><th>${t.name}</th><th>Токен</th><th>${t.permission}</th><th>${t.accesses}</th><th></th></tr></thead><tbody>${(data||[]).map(l=>`<tr><td>${l.nodes?.name||'?'}</td><td><span class="share-tok">${l.token.substring(0,16)}...</span></td><td>${l.permission}</td><td>${l.access_count}</td><td>${l.is_active?`<button class="btn-sm danger" onclick="revokeShare('${l.id}','${l.node_id}')">${t.revoke}</button>`:''}</td></tr>`).join('')}</tbody></table>`;}
+async function loadShared(){const c=document.getElementById('content')!;const data=await dedupFetch('share_links:list',async()=>{const{data,error}=await sb.from('share_links').select('*, nodes(name)').order('created_at',{ascending:false});if(error)throw new Error(error.message);return data||[];});updateBreadcrumbView(t.shared);c.innerHTML=(data||[]).length===0?`<div class="empty"><div class="empty-ic">&#128279;</div><div class="empty-t">${t.no_links}</div></div>`:`<table class="tbl"><thead><tr><th>${t.name}</th><th>Токен</th><th>${t.permission}</th><th>${t.accesses}</th><th></th></tr></thead><tbody>${(data||[]).map((l: any)=>`<tr><td>${l.nodes?.name||'?'}</td><td><span class="share-tok">${l.token.substring(0,16)}...</span></td><td>${l.permission}</td><td>${l.access_count}</td><td>${l.is_active?`<button class="btn-sm danger" onclick="revokeShare('${l.id}','${l.node_id}')">${t.revoke}</button>`:''}</td></tr>`).join('')}</tbody></table>`;}
 
 // --- Archived ---
-async function loadArchived(){const c=document.getElementById('content')!;const{data,error}=await sb.from('nodes').select('*').eq('is_archived',true).eq('is_deleted',false).order('updated_at',{ascending:false});if(error){c.innerHTML=errMsg(error.message);return;}updateBreadcrumbView(t.archive);c.innerHTML=`<div class="file-list">${(data||[]).map(n=>fileRow(n)).join('')}</div>`;bindFileRows();}
+async function loadArchived(){const c=document.getElementById('content')!;const data=await dedupFetch('nodes:archived',async()=>{const{data,error}=await sb.from('nodes').select('*').eq('is_archived',true).eq('is_deleted',false).order('updated_at',{ascending:false});if(error)throw new Error(error.message);return data||[];});updateBreadcrumbView(t.archive);c.innerHTML=`<div class="file-list">${(data||[]).map((n: any)=>fileRow(n)).join('')}</div>`;bindFileRows();}
 
 // --- Analytics ---
 async function loadAnalytics(){const c=document.getElementById('content')!;updateBreadcrumbView(t.analytics);const[nodesRes,blocksRes,versionsRes,auditRes,productsRes]=await Promise.all([sb.from('nodes').select('node_type,mime_type,size,created_at').eq('is_deleted',false),sb.from('data_blocks').select('size,ref_count,created_at'),sb.from('file_versions').select('total_size,is_compressed,created_at'),sb.from('audit_log').select('action,created_at').order('created_at',{ascending:false}).limit(200),sb.from('products').select('lifecycle_stage,status')]);const nodes=nodesRes.data||[];const blocks=blocksRes.data||[];const versions=versionsRes.data||[];const audit=auditRes.data||[];const products=productsRes.data||[];
@@ -802,18 +945,18 @@ c.innerHTML=`
   </div>`;}
 
 // --- Audit ---
-async function loadAudit(){const c=document.getElementById('content')!;const{data,error}=await sb.from('audit_log').select('*').order('created_at',{ascending:false}).limit(100);if(error){c.innerHTML=errMsg(error.message);return;}updateBreadcrumbView(t.audit);c.innerHTML=(data||[]).length===0?`<div class="empty"><div class="empty-ic">&#128203;</div><div class="empty-t">${t.no_audit}</div></div>`:`<table class="tbl"><thead><tr><th>${t.date}</th><th>${t.type}</th><th>Детали</th></tr></thead><tbody>${(data||[]).map((e:any)=>`<tr><td>${fmtDate(e.created_at)}</td><td>${fmtAction(e.action)}</td><td style="color:var(--text-3);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${JSON.stringify(e.details).substring(0,50)}</td></tr>`).join('')}</tbody></table>`;}
+async function loadAudit(){const c=document.getElementById('content')!;const data=await dedupFetch('audit_log:list',async()=>{const{data,error}=await sb.from('audit_log').select('*').order('created_at',{ascending:false}).limit(100);if(error)throw new Error(error.message);return data||[];});updateBreadcrumbView(t.audit);c.innerHTML=(data||[]).length===0?`<div class="empty"><div class="empty-ic">&#128203;</div><div class="empty-t">${t.no_audit}</div></div>`:`<table class="tbl"><thead><tr><th>${t.date}</th><th>${t.type}</th><th>Детали</th></tr></thead><tbody>${(data||[]).map((e:any)=>`<tr><td>${fmtDate(e.created_at)}</td><td>${fmtAction(e.action)}</td><td style="color:var(--text-3);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${JSON.stringify(e.details).substring(0,50)}</td></tr>`).join('')}</tbody></table>`;}
 
 // --- Blocks ---
-async function loadBlocks(){const c=document.getElementById('content')!;const{data,error}=await sb.from('data_blocks').select('*').order('created_at',{ascending:false}).limit(50);if(error){c.innerHTML=errMsg(error.message);return;}updateBreadcrumbView(t.storage);const blocks=data||[];const ts=blocks.reduce((a:number,b:any)=>a+b.size,0);const orphans=blocks.filter((b:any)=>b.ref_count<=0).length;c.innerHTML=`<div class="stats"><div class="stat-card"><div class="stat-val">${blocks.length}</div><div class="stat-lbl">${t.blocks}</div></div><div class="stat-card"><div class="stat-val">${fmtSize(ts)}</div><div class="stat-lbl">${t.total_size}</div></div><div class="stat-card"><div class="stat-val" style="color:${orphans>0?'var(--yellow)':'var(--green)'}">${orphans}</div><div class="stat-lbl">Орфаны</div></div></div><table class="tbl"><thead><tr><th>${t.hash}</th><th>${t.size}</th><th>${t.refs}</th><th>${t.compression}</th></tr></thead><tbody>${blocks.map((b:any)=>`<tr><td style="font-family:monospace;color:var(--accent);font-size:11px">${b.content_hash.substring(0,16)}...</td><td>${fmtSize(b.size)}</td><td style="color:${b.ref_count<=0?'var(--yellow)':'var(--text-0)'}">${b.ref_count}</td><td>${b.compression}</td></tr>`).join('')}</tbody></table>`;}
-(window as any).runGC=async()=>{try{const count=await garbageCollectBlocks('/vault');toast(`${t.gc_done}: ${count}`,'ok');loadBlocks();}catch(e:any){toast(e.message,'err');}};
+async function loadBlocks(){const c=document.getElementById('content')!;const blocks=await dedupFetch('data_blocks:list',async()=>{const{data,error}=await sb.from('data_blocks').select('*').order('created_at',{ascending:false}).limit(50);if(error)throw new Error(error.message);return data||[];});updateBreadcrumbView(t.storage);const ts=blocks.reduce((a:number,b:any)=>a+b.size,0);const orphans=blocks.filter((b:any)=>b.ref_count<=0).length;c.innerHTML=`<div class="stats"><div class="stat-card"><div class="stat-val">${blocks.length}</div><div class="stat-lbl">${t.blocks}</div></div><div class="stat-card"><div class="stat-val">${fmtSize(ts)}</div><div class="stat-lbl">${t.total_size}</div></div><div class="stat-card"><div class="stat-val" style="color:${orphans>0?'var(--yellow)':'var(--green)'}">${orphans}</div><div class="stat-lbl">Орфаны</div></div></div><table class="tbl"><thead><tr><th>${t.hash}</th><th>${t.size}</th><th>${t.refs}</th><th>${t.compression}</th></tr></thead><tbody>${blocks.map((b:any)=>`<tr><td style="font-family:monospace;color:var(--accent);font-size:11px">${b.content_hash.substring(0,16)}...</td><td>${fmtSize(b.size)}</td><td style="color:${b.ref_count<=0?'var(--yellow)':'var(--text-0)'}">${b.ref_count}</td><td>${b.compression}</td></tr>`).join('')}</tbody></table>`;}
+(window as any).runGC=async()=>{showLoading(t.gc);try{const count=await garbageCollectBlocks('/vault');cacheInvalidate('data_blocks:');toast(`${t.gc_done}: ${count}`,'ok');loadBlocks();}catch(e:any){toast(e.message,'err');}finally{hideLoading();}};
 
 // --- Admin ---
 async function loadAdmin(){const c=document.getElementById('content')!;updateBreadcrumbView(t.admin);const[profilesRes,nodesRes,blocksRes,versionsRes]=await Promise.all([sb.from('user_profiles').select('*').order('created_at',{ascending:false}),sb.from('nodes').select('*',{count:'exact',head:true}).eq('is_deleted',false),sb.from('data_blocks').select('*',{count:'exact',head:true}),sb.from('file_versions').select('*',{count:'exact',head:true})]);const users=profilesRes.data||[];c.innerHTML=`<div class="stats"><div class="stat-card"><div class="stat-val">${nodesRes.count||0}</div><div class="stat-lbl">${t.files}</div></div><div class="stat-card"><div class="stat-val">${versionsRes.count||0}</div><div class="stat-lbl">${t.versions}</div></div><div class="stat-card"><div class="stat-val">${blocksRes.count||0}</div><div class="stat-lbl">${t.blocks}</div></div></div><div class="section-header"><div class="section-title">${t.users}</div><button class="btn-sm primary" onclick="openAddUserModal()">+ ${t.add_user}</button></div><table class="tbl"><thead><tr><th>${t.email}</th><th>${t.role}</th><th>2FA</th><th>${t.created}</th><th></th></tr></thead><tbody>${users.map((u:any)=>`<tr><td style="font-weight:500">${u.email}</td><td><span class="acl-perm ${u.role==='owner'?'admin':u.role==='editor'?'write':'read'}">${u.role}</span></td><td>${u.totp_enabled?'<span class="badge badge-enc">ON</span>':'<span class="badge badge-arch">OFF</span>'}</td><td style="color:var(--text-3)">${fmtDate(u.created_at)}</td><td>${u.id!==currentUser?.id?`<button class="btn-sm danger" onclick="deleteUser('${u.id}')">${t.delete}</button>`:''}</td></tr>`).join('')}</tbody></table>`;}
 (window as any).openAddUserModal=()=>{const m=document.getElementById('modal')!;m.innerHTML=`<div class="modal-head"><div class="modal-title">${t.add_user}</div><button class="modal-x" onclick="closeModal()">&times;</button></div><div class="modal-body"><div class="fg"><label>${t.email}</label><input id="m-uname" type="email" placeholder="user@company.com" /></div><div class="fg"><label>${t.password}</label><input id="m-upw" type="password" placeholder="Минимум 6 символов" /></div><div class="fg"><label>${t.full_name}</label><input id="m-ufname" placeholder="Иванов И.И." /></div><div class="fg"><label>${t.role}</label><select id="m-role"><option value="viewer">viewer</option><option value="editor">editor</option><option value="auditor">auditor</option><option value="owner">owner</option></select></div></div><div class="modal-foot"><button class="btn-sm" onclick="closeModal()">${t.cancel}</button><button class="btn-sm primary" onclick="submitAddUser()">${t.create}</button></div>`;document.getElementById('modal-overlay')!.classList.add('open');};
 (window as any).submitAddUser=async()=>{const email=(document.getElementById('m-uname') as HTMLInputElement).value.trim();const pw=(document.getElementById('m-upw') as HTMLInputElement).value;const fname=(document.getElementById('m-ufname') as HTMLInputElement).value.trim();const role=(document.getElementById('m-role') as HTMLSelectElement).value;if(!email||!pw){toast('Укажите email и пароль','err');return;}const{error}=await sb.auth.signUp({email,password:pw,options:{data:{full_name:fname,role}}});(window as any).closeModal();if(error)toast('Ошибка: '+error.message,'err');else{toast(t.user_added,'ok');loadAdmin();}};
 (window as any).deleteUser=async(id:string)=>{if(!confirm('Удалить пользователя?'))return;const{error}=await sb.from('user_profiles').delete().eq('id',id);if(error){toast(error.message,'err');return;}loadAdmin();};
-(window as any).runArchive=async()=>{try{const result=await archiveOldVersions({versionAgeDays:90,fileIdleDays:180,compressionAlgorithm:'zstd',batchSize:100},currentUser?.id);toast(`${t.archive_done}: ${result.versionsArchived} версий`,'ok');loadAdmin();}catch(e:any){toast(e.message,'err');}};
+(window as any).runArchive=async()=>{showLoading(t.run_archive);try{const result=await archiveOldVersions({versionAgeDays:90,fileIdleDays:180,compressionAlgorithm:'zstd',batchSize:100},currentUser?.id);cacheInvalidate('nodes:');toast(`${t.archive_done}: ${result.versionsArchived} версий`,'ok');loadAdmin();}catch(e:any){toast(e.message,'err');}finally{hideLoading();}};
 
 // --- Server/Connection config ---
 async function loadServer(){const c=document.getElementById('content')!;updateBreadcrumbView(t.connection);const[connRes,serverRes]=await Promise.all([sb.from('connection_config').select('*').order('key'),sb.from('server_config').select('*').order('key')]);const conn=connRes.data||[];const server=serverRes.data||[];
@@ -1017,7 +1160,7 @@ async function loadBackups() {
 (window as any).submitCreateBackup = async () => {
   const type = (document.getElementById('m-backup-type') as HTMLSelectElement).value;
   (window as any).closeModal();
-  toast('Создание бэкапа...', 'ok');
+  showLoading(t.create_backup);
   try {
     const res = await fetch(`${VAULT_API}/backups`, {
       method: 'POST',
@@ -1029,10 +1172,11 @@ async function loadBackups() {
     toast(`${t.backup_created}: ${data.total_nodes} файлов, ${data.total_blocks} блоков`, 'ok');
     loadBackups();
   } catch (e: any) { toast(e.message, 'err'); }
+  finally { hideLoading(); }
 };
 
 (window as any).verifyBackup = async (id: string) => {
-  toast('Проверка бэкапа...', 'ok');
+  showLoading(t.verify);
   try {
     const res = await fetch(`${VAULT_API}/backups/verify`, {
       method: 'POST',
@@ -1044,11 +1188,12 @@ async function loadBackups() {
     toast(data.is_valid ? t.backup_verified : 'Бэкап повреждён!', data.is_valid ? 'ok' : 'err');
     loadBackups();
   } catch (e: any) { toast(e.message, 'err'); }
+  finally { hideLoading(); }
 };
 
 (window as any).restoreBackup = async (id: string) => {
   if (!confirm(t.restore_confirm)) return;
-  toast('Восстановление...', 'ok');
+  showLoading(t.restore);
   try {
     const res = await fetch(`${VAULT_API}/backups/restore`, {
       method: 'POST',
@@ -1057,13 +1202,15 @@ async function loadBackups() {
     });
     const data = await res.json();
     if (data.error) { toast(data.error, 'err'); return; }
+    cacheInvalidate('nodes:');
     toast(t.backup_restored, 'ok');
     loadBackups();
   } catch (e: any) { toast(e.message, 'err'); }
+  finally { hideLoading(); }
 };
 
 (window as any).runIntegrityCheckAll = async () => {
-  toast('Проверка целостности файлов...', 'ok');
+  showLoading(t.integrity_check);
   try {
     const { data: nodes } = await sb.from('nodes').select('id').eq('is_deleted', false).eq('node_type', 'file').limit(50);
     if (!nodes || nodes.length === 0) { toast('Нет файлов для проверки', 'err'); return; }
@@ -1082,6 +1229,7 @@ async function loadBackups() {
     toast(`${t.integrity_checked}: ${checked} файлов, ${issues} проблем`, issues > 0 ? 'err' : 'ok');
     loadBackups();
   } catch (e: any) { toast(e.message, 'err'); }
+  finally { hideLoading(); }
 };
 
 // --- Helpers ---
