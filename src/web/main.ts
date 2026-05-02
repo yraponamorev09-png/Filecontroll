@@ -491,15 +491,17 @@ function renderTreeLevel(byParent: Record<string,any[]>,parentId:string,depth:nu
   return (byParent[parentId]||[]).filter(n=>n.node_type==='folder').map(n => {
     const isOpen=treeExpanded.has(n.id);
     const hasChildren = !!byParent[n.id]?.filter((c: any) => c.node_type === 'folder').length;
-    return `<div class="tree-item${currentParentId===n.id?' active':''}" data-id="${n.id}"><span class="ti-arrow${isOpen?' open':''}">${hasChildren ? '&#9654;' : ''}</span><span class="ti-ic">&#128193;</span>${n.name}</div>${isOpen?`<div class="tree-children">${renderTreeLevel(byParent,n.id,depth+1)}</div>`:''}`;
+    return `<div class="tree-item${currentParentId===n.id?' active':''}" data-id="${n.id}"><span class="ti-arrow${isOpen?' open':''}">${hasChildren ? '&#9654;' : ''}</span><span class="ti-ic">&#128193;</span><span class="ti-name">${n.name}</span></div>${isOpen?`<div class="tree-children">${renderTreeLevel(byParent,n.id,depth+1)}</div>`:''}`;
   }).join('');
 }
 function bindTreeItems() {
-  document.querySelectorAll('.tree-item').forEach(item => {
+  document.querySelectorAll('.tree-item:not([data-bound])').forEach(item => {
+    (item as HTMLElement).dataset.bound='1';
     item.addEventListener('click', () => {
       const id=(item as HTMLElement).dataset.id!;
       if(treeExpanded.has(id))treeExpanded.delete(id);else treeExpanded.add(id);
-      pathStack=[{id:null,name:'Хранилище'},{id,name:item.textContent!.trim()}];
+      const nameEl=item.querySelector('.ti-name')||item;
+      pathStack=[{id:null,name:'Хранилище'},{id,name:nameEl.textContent!.trim()}];
       currentParentId=id; loadTree(); loadFiles(id);
       (document.getElementById('btn-back') as HTMLElement).style.display='flex';
     });
@@ -844,7 +846,8 @@ function setupVirtualScroll(nodes: any[]) {
 }
 
 function bindFileRows() {
-  document.querySelectorAll('.file-row').forEach(r=>{
+  document.querySelectorAll('.file-row:not([data-bound])').forEach(r=>{
+    (r as HTMLElement).dataset.bound='1';
     r.addEventListener('click',()=>{const id=(r as HTMLElement).dataset.id!,type=(r as HTMLElement).dataset.type!;if(type==='folder'){const name=r.querySelector('.fr-name')!.textContent!;pathStack.push({id,name});currentParentId=id;(document.getElementById('btn-back') as HTMLElement).style.display='flex';loadFiles(id);}else{document.querySelectorAll('.file-row.selected').forEach(x=>x.classList.remove('selected'));r.classList.add('selected');openDetail(id);}});
     r.addEventListener('dblclick',()=>{const type=(r as HTMLElement).dataset.type!;if(type==='file')previewFile((r as HTMLElement).dataset.id!);});
   });
@@ -857,7 +860,24 @@ async function processUploadQueue(){if(uploadQueue.length===0){isUploading=false
 function renderUploadProgress(){const el=document.getElementById('upload-progress');if(!el)return;if(uploadQueue.length===0){el.innerHTML='';return;}el.innerHTML=uploadQueue.map(item=>`<div style="background:var(--bg-1);border:1px solid var(--border);border-radius:var(--r);padding:4px 10px;margin-bottom:3px;display:flex;align-items:center;gap:6px"><span style="font-size:11px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${item.file.name}</span><div class="progress-bar" style="width:60px"><div class="progress-fill" style="width:${item.progress}%"></div></div><span style="font-size:10px;color:var(--accent);width:28px;text-align:right">${item.progress}%</span></div>`).join('');}
 async function uploadFileWithProgress(item:{file:File;progress:number}){if(!currentUser)throw new Error('No user');const file=item.file;const buf=await file.arrayBuffer();const size=buf.byteLength;const id=uuidv4();item.progress=20;renderUploadProgress();const{error:nodeErr}=await sb.from('nodes').insert({id,parent_id:currentParentId,owner_id:currentUser.id,name:file.name,node_type:'file',path:`/${file.name}`,mime_type:file.type||'application/octet-stream',size});if(nodeErr)throw nodeErr;item.progress=40;renderUploadProgress();const hashBuf=await crypto.subtle.digest('SHA-256',buf);const hash=Array.from(new Uint8Array(hashBuf)).map(b=>b.toString(16).padStart(2,'0')).join('');item.progress=60;renderUploadProgress();const vid=uuidv4();await sb.from('file_versions').insert({id:vid,node_id:id,version_number:1,total_size:size,content_hash:hash,encrypted_key:new Uint8Array(32),key_nonce:new Uint8Array(24),is_current:true,is_compressed:false,created_by:currentUser.id,comment:'Загружен'});item.progress=75;renderUploadProgress();const bid=uuidv4();await sb.from('data_blocks').insert({id:bid,content_hash:hash,encrypted_hash:hash,size,encrypted_size:size+16,physical_path:`/vault/blocks/${hash.substring(0,2)}/${hash}`,compression:'none',ref_count:1});await sb.from('file_version_blocks').insert({id:uuidv4(),version_id:vid,block_id:bid,block_index:0,block_offset:0});item.progress=90;renderUploadProgress();await sb.from('audit_log').insert({id:uuidv4(),user_id:currentUser.id,node_id:id,action:'version_create',details:{version_number:1,size}});item.progress=100;renderUploadProgress();}
 (window as any).triggerUpload=()=>{(document.getElementById('file-input') as HTMLInputElement).click();};
-(window as any).createFolder=async()=>{if(!currentUser)return;const name='Новая папка';const id=uuidv4();const tempNode={id,parent_id:currentParentId,owner_id:currentUser.id,name,node_type:'folder',path:`/${name}`,size:0,mime_type:null,is_archived:false,is_deleted:false,updated_at:new Date().toISOString(),created_at:new Date().toISOString()};optimisticInsertRow(document.getElementById('content')!,fileRow(tempNode));try{await sb.from('nodes').insert({id,parent_id:currentParentId,owner_id:currentUser.id,name,node_type:'folder',path:`/${name}`,size:0});cacheInvalidate('nodes:');toast(t.folder_created,'ok');loadTree();loadFiles(currentParentId);}catch(e:any){toast(e.message,'err');loadFiles(currentParentId);}};
+(window as any).createFolder=async()=>{
+  if(!currentUser)return;
+  const name='Новая папка';
+  const id=uuidv4();
+  const tempNode={id,parent_id:currentParentId,owner_id:currentUser.id,name,node_type:'folder',path:`/${name}`,size:0,mime_type:null,is_archived:false,is_deleted:false,updated_at:new Date().toISOString(),created_at:new Date().toISOString()};
+  optimisticInsertRow(document.getElementById('content')!,fileRow(tempNode));
+  try{
+    const{error}=await sb.from('nodes').insert({id,parent_id:currentParentId,owner_id:currentUser.id,name,node_type:'folder',path:`/${name}`,size:0});
+    if(error){toast(error.message,'err');loadFiles(currentParentId);return;}
+    cacheInvalidate('nodes:');
+    toast(t.folder_created,'ok');
+    loadTree();
+    loadFiles(currentParentId);
+  }catch(e:any){
+    toast(e.message,'err');
+    loadFiles(currentParentId);
+  }
+};
 
 // --- Breadcrumb ---
 function updateBreadcrumb(){document.getElementById('bc')!.innerHTML=pathStack.map((p,i)=>`<a onclick="navTo(${i})">${p.name}</a>${i<pathStack.length-1?'<span class="sep">/</span>':''}`).join('');}
