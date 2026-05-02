@@ -75,7 +75,7 @@ export function joinPresence(
     config: { presence: { key: userId } },
   });
 
-  presenceChannel.on('presence', { event: 'sync' }, () => {
+  const flushPresenceUsers = () => {
     const state = presenceChannel!.presenceState();
     const users: any[] = [];
     for (const [, presences] of Object.entries(state)) {
@@ -84,7 +84,11 @@ export function joinPresence(
       }
     }
     onUpdate(users);
-  });
+  };
+
+  presenceChannel.on('presence', { event: 'sync' }, flushPresenceUsers);
+  presenceChannel.on('presence', { event: 'join' }, flushPresenceUsers);
+  presenceChannel.on('presence', { event: 'leave' }, flushPresenceUsers);
 
   presenceChannel.subscribe(async (status: string) => {
     if (status === 'SUBSCRIBED') {

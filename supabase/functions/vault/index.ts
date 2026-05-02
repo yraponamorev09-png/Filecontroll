@@ -21,17 +21,100 @@ function errorResponse(message: string, code: string, status = 500): Response {
   });
 }
 
+type PermResult = {
+  allowed: boolean;
+  source: string | null;
+  matched_permission: string | null;
+  notFound?: boolean;
+};
+
+async function getVerifiedAuth(req: Request, supabaseUrl: string, anonKey: string): Promise<{ id: string; jwt: string } | null> {
+  const authHeader = req.headers.get("Authorization");
+  if (!authHeader?.startsWith("Bearer ")) return null;
+  const jwt = authHeader.slice(7).trim();
+  if (!jwt) return null;
+  const ac = createClient(supabaseUrl, anonKey);
+  const { data: { user }, error } = await ac.auth.getUser(jwt);
+  if (error || !user?.id) return null;
+  return { id: user.id, jwt };
+}
+
+function createUserClient(supabaseUrl: string, anonKey: string, jwt: string) {
+  return createClient(supabaseUrl, anonKey, {
+    global: { headers: { Authorization: `Bearer ${jwt}` } },
+  });
+}
+
+async function requireAppOwner(sb: ReturnType<typeof createClient>, userId: string): Promise<Response | null> {
+  const { data: prof } = await sb.from("user_profiles").select("role").eq("id", userId).maybeSingle();
+  if (prof?.role !== "owner") {
+    return errorResponse("Только роль owner может выполнять эту операцию", "FORBIDDEN", 403);
+  }
+  return null;
+}
+
+async function evaluateNodePermission(
+  sb: ReturnType<typeof createClient>,
+  user_id: string,
+  node_id: string,
+  action: string,
+): Promise<PermResult> {
+  const { data: node } = await sb.from("nodes").select("id, owner_id, parent_id").eq("id", node_id).maybeSingle();
+  if (!node) return { allowed: false, source: null, matched_permission: null, notFound: true };
+
+  if (node.owner_id === user_id) {
+    return { allowed: true, source: "owner", matched_permission: "admin" };
+  }
+
+  const { data: acls } = await sb.from("access_control_lists").select("permission, inherit").eq("node_id", node_id).eq("user_id", user_id);
+
+  const permRank: Record<string, number> = { read: 1, write: 2, admin: 3 };
+  const actionPerm: Record<string, string> = { read: "read", write: "write", delete: "admin", admin: "admin", share: "admin" };
+  const required = actionPerm[action] || "admin";
+
+  if (acls && acls.length > 0) {
+    const best = acls.reduce((b: string | null, a: { permission: string }) =>
+      !b || permRank[a.permission] > permRank[b] ? a.permission : b, null);
+    if (best && permRank[best] >= permRank[required]) {
+      return { allowed: true, source: "direct", matched_permission: best };
+    }
+  }
+
+  let parentId: string | null = node.parent_id;
+  const visited = new Set<string>([node_id]);
+  while (parentId && !visited.has(parentId)) {
+    visited.add(parentId);
+    const { data: parentAcls } = await sb.from("access_control_lists").select("permission").eq("node_id", parentId).eq("user_id", user_id).eq("inherit", true);
+    if (parentAcls && parentAcls.length > 0) {
+      const best = parentAcls.reduce((b: string | null, a: { permission: string }) =>
+        !b || permRank[a.permission] > permRank[b] ? a.permission : b, null);
+      if (best && permRank[best] >= permRank[required]) {
+        return { allowed: true, source: "inherited", matched_permission: best };
+      }
+    }
+    const { data: pNode } = await sb.from("nodes").select("parent_id, owner_id").eq("id", parentId).maybeSingle();
+    if (!pNode) break;
+    if (pNode.owner_id === user_id) return { allowed: true, source: "inherited", matched_permission: "admin" };
+    parentId = pNode.parent_id;
+  }
+
+  return { allowed: false, source: "denied", matched_permission: null };
+}
+
 // --- Versioning ---
 
 async function saveFileVersion(sb: ReturnType<typeof createClient>, body: {
   node_id: string;
-  user_id: string;
   content_hash: string;
   size: number;
   blocks: { hash: string; size: number; index: number }[];
   vault_dir: string;
-}) {
-  const { node_id, user_id, content_hash, size, blocks, vault_dir } = body;
+}, verifiedUserId: string) {
+  const { node_id, content_hash, size, blocks, vault_dir } = body;
+  const perm = await evaluateNodePermission(sb, verifiedUserId, node_id, "write");
+  if (perm.notFound) return errorResponse("Node not found", "NODE_NOT_FOUND", 404);
+  if (!perm.allowed) return errorResponse("Forbidden", "FORBIDDEN", 403);
+  const user_id = verifiedUserId;
 
   const { data: node, error: nodeErr } = await sb
     .from("nodes")
@@ -129,66 +212,30 @@ async function saveFileVersion(sb: ReturnType<typeof createClient>, body: {
 
 // --- Access Control ---
 
-async function checkPermissionHandler(sb: ReturnType<typeof createClient>, body: {
-  user_id: string;
-  node_id: string;
-  action: string;
-}) {
-  const { user_id, node_id, action } = body;
-
-  const { data: node } = await sb.from("nodes").select("id, owner_id, parent_id").eq("id", node_id).maybeSingle();
-  if (!node) return errorResponse("Node not found", "NODE_NOT_FOUND", 404);
-
-  if (node.owner_id === user_id) {
-    return jsonResponse({ allowed: true, source: "owner", matched_permission: "admin" });
-  }
-
-  const { data: acls } = await sb.from("access_control_lists").select("permission, inherit").eq("node_id", node_id).eq("user_id", user_id);
-
-  const permRank: Record<string, number> = { read: 1, write: 2, admin: 3 };
-  const actionPerm: Record<string, string> = { read: "read", write: "write", delete: "admin", admin: "admin", share: "admin" };
-  const required = actionPerm[action] || "admin";
-
-  if (acls && acls.length > 0) {
-    const best = acls.reduce((b: string | null, a: { permission: string }) =>
-      !b || permRank[a.permission] > permRank[b] ? a.permission : b, null);
-    if (best && permRank[best] >= permRank[required]) {
-      return jsonResponse({ allowed: true, source: "direct", matched_permission: best });
-    }
-  }
-
-  let parentId: string | null = node.parent_id;
-  const visited = new Set<string>([node_id]);
-  while (parentId && !visited.has(parentId)) {
-    visited.add(parentId);
-    const { data: parentAcls } = await sb.from("access_control_lists").select("permission").eq("node_id", parentId).eq("user_id", user_id).eq("inherit", true);
-    if (parentAcls && parentAcls.length > 0) {
-      const best = parentAcls.reduce((b: string | null, a: { permission: string }) =>
-        !b || permRank[a.permission] > permRank[b] ? a.permission : b, null);
-      if (best && permRank[best] >= permRank[required]) {
-        return jsonResponse({ allowed: true, source: "inherited", matched_permission: best });
-      }
-    }
-    const { data: pNode } = await sb.from("nodes").select("parent_id, owner_id").eq("id", parentId).maybeSingle();
-    if (!pNode) break;
-    if (pNode.owner_id === user_id) return jsonResponse({ allowed: true, source: "inherited", matched_permission: "admin" });
-    parentId = pNode.parent_id;
-  }
-
-  return jsonResponse({ allowed: false, source: "denied", matched_permission: null });
+async function checkPermissionHandler(
+  sb: ReturnType<typeof createClient>,
+  body: { node_id: string; action: string },
+  verifiedUserId: string,
+) {
+  const r = await evaluateNodePermission(sb, verifiedUserId, body.node_id, body.action);
+  if (r.notFound) return errorResponse("Node not found", "NODE_NOT_FOUND", 404);
+  return jsonResponse({ allowed: r.allowed, source: r.source, matched_permission: r.matched_permission });
 }
 
 // --- Sharing ---
 
 async function createShareLinkHandler(sb: ReturnType<typeof createClient>, body: {
-  user_id: string;
   node_id: string;
   password?: string;
   expires_in_hours?: number;
   max_access_count?: number;
   permission?: "read" | "write";
-}) {
-  const { user_id, node_id, password, expires_in_hours, max_access_count, permission } = body;
+}, verifiedUserId: string) {
+  const { node_id, password, expires_in_hours, max_access_count, permission } = body;
+  const user_id = verifiedUserId;
+  const perm = await evaluateNodePermission(sb, user_id, node_id, "share");
+  if (perm.notFound) return errorResponse("Node not found", "NODE_NOT_FOUND", 404);
+  if (!perm.allowed) return errorResponse("Forbidden", "FORBIDDEN", 403);
 
   const tokenBytes = new Uint8Array(48);
   crypto.getRandomValues(tokenBytes);
@@ -240,11 +287,13 @@ async function createShareLinkHandler(sb: ReturnType<typeof createClient>, body:
 // --- Backup ---
 
 async function createBackupHandler(sb: ReturnType<typeof createClient>, body: {
-  user_id: string;
   type: "full" | "incremental" | "metadata_only" | "blocks_only";
   since_backup_id?: string;
-}) {
-  const { user_id, type, since_backup_id } = body;
+}, verifiedUserId: string) {
+  const ownerErr = await requireAppOwner(sb, verifiedUserId);
+  if (ownerErr) return ownerErr;
+  const user_id = verifiedUserId;
+  const { type, since_backup_id } = body;
   const backupId = uuidv4();
 
   // Create backup record
@@ -393,7 +442,9 @@ async function createBackupHandler(sb: ReturnType<typeof createClient>, body: {
 
 // --- Backup Verification ---
 
-async function verifyBackupHandler(sb: ReturnType<typeof createClient>, backupId: string) {
+async function verifyBackupHandler(sb: ReturnType<typeof createClient>, backupId: string, verifiedUserId: string) {
+  const ownerErr = await requireAppOwner(sb, verifiedUserId);
+  if (ownerErr) return ownerErr;
   const { data: backup } = await sb.from("backups").select("*").eq("id", backupId).maybeSingle();
   if (!backup) return errorResponse("Backup not found", "NOT_FOUND", 404);
 
@@ -446,10 +497,13 @@ async function verifyBackupHandler(sb: ReturnType<typeof createClient>, backupId
 // --- File Integrity Check ---
 
 async function checkFileIntegrityHandler(sb: ReturnType<typeof createClient>, body: {
-  user_id: string;
   node_id: string;
-}) {
-  const { user_id, node_id } = body;
+}, verifiedUserId: string) {
+  const user_id = verifiedUserId;
+  const { node_id } = body;
+  const perm = await evaluateNodePermission(sb, user_id, node_id, "read");
+  if (perm.notFound) return errorResponse("Node not found", "NODE_NOT_FOUND", 404);
+  if (!perm.allowed) return errorResponse("Forbidden", "FORBIDDEN", 403);
 
   const { data: node } = await sb.from("nodes").select("*").eq("id", node_id).maybeSingle();
   if (!node) return errorResponse("Node not found", "NOT_FOUND", 404);
@@ -533,11 +587,13 @@ async function checkFileIntegrityHandler(sb: ReturnType<typeof createClient>, bo
 // --- Backup Restore (Point-in-time) ---
 
 async function restoreBackupHandler(sb: ReturnType<typeof createClient>, body: {
-  user_id: string;
   backup_id: string;
   tables?: string[];
-}) {
-  const { user_id, backup_id, tables } = body;
+}, verifiedUserId: string) {
+  const ownerErr = await requireAppOwner(sb, verifiedUserId);
+  if (ownerErr) return ownerErr;
+  const user_id = verifiedUserId;
+  const { backup_id, tables } = body;
 
   const { data: backup } = await sb.from("backups").select("*").eq("id", backup_id).maybeSingle();
   if (!backup) return errorResponse("Backup not found", "NOT_FOUND", 404);
@@ -609,20 +665,6 @@ async function restoreBackupHandler(sb: ReturnType<typeof createClient>, body: {
 
 // --- Router ---
 
-function extractUserId(req: Request): string | null {
-  const authHeader = req.headers.get("Authorization");
-  if (!authHeader) return null;
-  try {
-    const token = authHeader.replace("Bearer ", "");
-    const parts = token.split(".");
-    if (parts.length !== 3) return null;
-    const payload = JSON.parse(atob(parts[1]));
-    return payload.sub || null;
-  } catch {
-    return null;
-  }
-}
-
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 200, headers: corsHeaders });
@@ -632,45 +674,46 @@ Deno.serve(async (req: Request) => {
   const path = url.pathname.replace("/vault", "") || "/";
 
   const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+  const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY")!;
   const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
   const sb = createClient(supabaseUrl, supabaseKey);
 
-  const authUserId = extractUserId(req);
+  const auth = await getVerifiedAuth(req, supabaseUrl, supabaseAnonKey);
+  if (!auth) return errorResponse("Unauthorized", "UNAUTHORIZED", 401);
+  const { id: authUserId, jwt } = auth;
+  const sbUser = createUserClient(supabaseUrl, supabaseAnonKey, jwt);
 
   try {
     // --- Versioning ---
     if (req.method === "POST" && path === "/versions") {
-      if (!authUserId) return errorResponse("Unauthorized", "UNAUTHORIZED", 401);
       const body = await req.json();
-      return await saveFileVersion(sb, body);
+      return await saveFileVersion(sb, body, authUserId);
     }
 
     if (req.method === "GET" && path === "/versions") {
       const nodeId = url.searchParams.get("node_id");
       if (!nodeId) return errorResponse("node_id required", "MISSING_PARAM", 400);
-      const { data, error } = await sb.from("file_versions").select("*").eq("node_id", nodeId).order("version_number", { ascending: false });
+      const { data, error } = await sbUser.from("file_versions").select("*").eq("node_id", nodeId).order("version_number", { ascending: false });
       if (error) return errorResponse(error.message, "DB_ERROR");
       return jsonResponse(data);
     }
 
     // --- Permissions ---
     if (req.method === "POST" && path === "/permissions/check") {
-      if (!authUserId) return errorResponse("Unauthorized", "UNAUTHORIZED", 401);
       const body = await req.json();
-      return await checkPermissionHandler(sb, body);
+      return await checkPermissionHandler(sb, body, authUserId);
     }
 
     // --- Sharing ---
     if (req.method === "POST" && path === "/share-links") {
-      if (!authUserId) return errorResponse("Unauthorized", "UNAUTHORIZED", 401);
       const body = await req.json();
-      return await createShareLinkHandler(sb, body);
+      return await createShareLinkHandler(sb, body, authUserId);
     }
 
     // --- Nodes ---
     if (req.method === "GET" && path === "/nodes") {
       const parentId = url.searchParams.get("parent_id");
-      const query = sb.from("nodes").select("*").eq("is_deleted", false).order("name");
+      const query = sbUser.from("nodes").select("*").eq("is_deleted", false).order("name");
       if (parentId) query.eq("parent_id", parentId);
       else query.is("parent_id", null);
       const { data, error } = await query;
@@ -681,7 +724,7 @@ Deno.serve(async (req: Request) => {
     // --- Audit ---
     if (req.method === "GET" && path === "/audit") {
       const nodeId = url.searchParams.get("node_id");
-      const query = sb.from("audit_log").select("*").order("created_at", { ascending: false }).limit(100);
+      const query = sbUser.from("audit_log").select("*").order("created_at", { ascending: false }).limit(100);
       if (nodeId) query.eq("node_id", nodeId);
       const { data, error } = await query;
       if (error) return errorResponse(error.message, "DB_ERROR");
@@ -690,14 +733,13 @@ Deno.serve(async (req: Request) => {
 
     // --- Backup: Create ---
     if (req.method === "POST" && path === "/backups") {
-      if (!authUserId) return errorResponse("Unauthorized", "UNAUTHORIZED", 401);
       const body = await req.json();
-      return await createBackupHandler(sb, body);
+      return await createBackupHandler(sb, body, authUserId);
     }
 
     // --- Backup: List ---
     if (req.method === "GET" && path === "/backups") {
-      const { data, error } = await sb.from("backups").select("id, type, status, total_nodes, total_versions, total_blocks, total_size, checksum, is_verified, started_at, completed_at, created_by, error_message").order("started_at", { ascending: false }).limit(50);
+      const { data, error } = await sbUser.from("backups").select("id, type, status, total_nodes, total_versions, total_blocks, total_size, checksum, is_verified, started_at, completed_at, created_by, error_message").order("started_at", { ascending: false }).limit(50);
       if (error) return errorResponse(error.message, "DB_ERROR");
       return jsonResponse(data);
     }
@@ -706,36 +748,33 @@ Deno.serve(async (req: Request) => {
     if (req.method === "GET" && path === "/backups/detail") {
       const backupId = url.searchParams.get("id");
       if (!backupId) return errorResponse("id required", "MISSING_PARAM", 400);
-      const { data, error } = await sb.from("backups").select("*").eq("id", backupId).maybeSingle();
+      const { data, error } = await sbUser.from("backups").select("*").eq("id", backupId).maybeSingle();
       if (error || !data) return errorResponse("Backup not found", "NOT_FOUND", 404);
       return jsonResponse(data);
     }
 
     // --- Backup: Verify ---
     if (req.method === "POST" && path === "/backups/verify") {
-      if (!authUserId) return errorResponse("Unauthorized", "UNAUTHORIZED", 401);
       const body = await req.json();
-      return await verifyBackupHandler(sb, body.backup_id);
+      return await verifyBackupHandler(sb, body.backup_id, authUserId);
     }
 
     // --- Backup: Restore ---
     if (req.method === "POST" && path === "/backups/restore") {
-      if (!authUserId) return errorResponse("Unauthorized", "UNAUTHORIZED", 401);
       const body = await req.json();
-      return await restoreBackupHandler(sb, body);
+      return await restoreBackupHandler(sb, body, authUserId);
     }
 
     // --- File Integrity Check ---
     if (req.method === "POST" && path === "/integrity-check") {
-      if (!authUserId) return errorResponse("Unauthorized", "UNAUTHORIZED", 401);
       const body = await req.json();
-      return await checkFileIntegrityHandler(sb, body);
+      return await checkFileIntegrityHandler(sb, body, authUserId);
     }
 
     // --- File Integrity: Get results ---
     if (req.method === "GET" && path === "/integrity-check") {
       const nodeId = url.searchParams.get("node_id");
-      const query = sb.from("file_integrity_checks").select("*").order("checked_at", { ascending: false }).limit(100);
+      const query = sbUser.from("file_integrity_checks").select("*").order("checked_at", { ascending: false }).limit(100);
       if (nodeId) query.eq("node_id", nodeId);
       const { data, error } = await query;
       if (error) return errorResponse(error.message, "DB_ERROR");

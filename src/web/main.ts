@@ -35,7 +35,9 @@ let uploadQueue: { file: File; progress: number }[] = [];
 let isUploading = false;
 let searchTimeout: any = null;
 let ctxMenuEl: HTMLElement | null = null;
-let collabInterval: any = null;
+/** Ленивая загрузка: ключ — `TREE_ROOT_KEY` или id папки; значение — дочерние папки. */
+const TREE_ROOT_KEY = '__root__';
+let treeFoldersByParent: Record<string, any[]> = {};
 let treeExpanded: Set<string> = new Set();
 let realtimeSetup = false;
 let loadingOverlay: HTMLElement | null = null;
@@ -189,7 +191,33 @@ function optimisticUpdateRow(nodeId: string, updates: Record<string, string>) {
   }
   row.style.transition = 'background 0.3s';
   row.style.background = 'var(--accent-bg)';
-  setTimeout(() => { row.style.background = ''; }, 600);
+  setTimeout(() => {   row.style.background = ''; }, 600);
+}
+
+function invalidateNodesAndTreeCaches() {
+  treeFoldersByParent = {};
+  cacheInvalidate('nodes:');
+}
+
+async function fetchChildFolders(parentId: string | null): Promise<any[]> {
+  let q = sb
+    .from('nodes')
+    .select('*')
+    .eq('is_deleted', false)
+    .eq('is_archived', false)
+    .eq('node_type', 'folder')
+    .order('name');
+  q = parentId === null ? q.is('parent_id', null) : q.eq('parent_id', parentId);
+  const { data, error } = await q;
+  if (error) throw error;
+  return data || [];
+}
+
+async function ensureFolderChildrenCached(parentKey: string, dbParentId: string | null) {
+  if (Object.prototype.hasOwnProperty.call(treeFoldersByParent, parentKey)) return;
+  const cacheKey = dbParentId === null ? 'nodes:tree-children:root' : `nodes:tree-children:${dbParentId}`;
+  const rows = await dedupFetch(cacheKey, () => fetchChildFolders(dbParentId), 15000);
+  treeFoldersByParent[parentKey] = rows;
 }
 
 // --- Init ---
@@ -206,7 +234,7 @@ async function init() {
   setupKeyboard();
   setupGlobalClicks();
   loadView('products');
-  startCollabPoll();
+  setupRealtimeSubscriptions();
 }
 
 // --- Auth UI ---
@@ -300,7 +328,7 @@ function showConnectionSetup() {
   const state = auth.getState();
   currentUser = { id: state.user.id, email: state.user.email, ...state.profile };
   await seedIfEmpty();
-  renderNav(); loadTree(); setupSearch(); setupKeyboard(); setupGlobalClicks(); loadView('products'); startCollabPoll();
+  renderNav(); loadTree(); setupSearch(); setupKeyboard(); setupGlobalClicks(); loadView('products'); setupRealtimeSubscriptions();
 };
 
 (window as any).handleRegister = async () => {
@@ -327,7 +355,7 @@ function showConnectionSetup() {
   const state = auth.getState();
   currentUser = { id: state.user.id, email: state.user.email, ...state.profile };
   await seedIfEmpty();
-  renderNav(); loadTree(); setupSearch(); setupKeyboard(); setupGlobalClicks(); loadView('products'); startCollabPoll();
+  renderNav(); loadTree(); setupSearch(); setupKeyboard(); setupGlobalClicks(); loadView('products'); setupRealtimeSubscriptions();
 };
 
 (window as any).handleResetPassword = async () => {
@@ -344,6 +372,7 @@ function showConnectionSetup() {
   unsubscribeAll(sb);
   leavePresence(sb);
   realtimeSetup = false;
+  treeFoldersByParent = {};
   cacheClear();
   await auth.signOut();
   currentUser = null;
@@ -475,35 +504,50 @@ function loadView(view: string) {
   if (pathStack.length>1) { pathStack.pop(); currentParentId=pathStack[pathStack.length-1].id; loadFiles(currentParentId); (document.getElementById('btn-back') as HTMLElement).style.display=pathStack.length>1?'flex':'none'; }
 };
 
-// --- Tree (lazy loading) ---
+// --- Tree (ленивая загрузка вложенных папок) ---
 async function loadTree() {
-  const cacheKey = 'nodes:tree';
-  const nodes = await dedupFetch(cacheKey, async () => {
-    const { data } = await sb.from('nodes').select('*').eq('is_deleted', false).eq('is_archived', false).order('node_type').order('name');
-    return data || [];
-  }, 15000);
-  const byParent: Record<string,any[]> = {};
-  nodes.forEach((n: any) => { const pid=n.parent_id||'__root__'; if(!byParent[pid])byParent[pid]=[]; byParent[pid].push(n); });
-  document.getElementById('tree-body')!.innerHTML = renderTreeLevel(byParent,'__root__',0);
+  try {
+    await ensureFolderChildrenCached(TREE_ROOT_KEY, null);
+    for (const fid of [...treeExpanded]) {
+      await ensureFolderChildrenCached(fid, fid);
+    }
+  } catch (e: any) {
+    console.error(e);
+  }
+  document.getElementById('tree-body')!.innerHTML = renderTreeLevel(TREE_ROOT_KEY, 0);
   bindTreeItems();
 }
-function renderTreeLevel(byParent: Record<string,any[]>,parentId:string,depth:number): string {
-  return (byParent[parentId]||[]).filter(n=>n.node_type==='folder').map(n => {
-    const isOpen=treeExpanded.has(n.id);
-    const hasChildren = !!byParent[n.id]?.filter((c: any) => c.node_type === 'folder').length;
-    return `<div class="tree-item${currentParentId===n.id?' active':''}" data-id="${n.id}"><span class="ti-arrow${isOpen?' open':''}">${hasChildren ? '&#9654;' : ''}</span><span class="ti-ic">&#128193;</span><span class="ti-name">${n.name}</span></div>${isOpen?`<div class="tree-children">${renderTreeLevel(byParent,n.id,depth+1)}</div>`:''}`;
+function renderTreeLevel(parentKey: string, depth: number): string {
+  const list = treeFoldersByParent[parentKey] || [];
+  return list.map((n: any) => {
+    const isOpen = treeExpanded.has(n.id);
+    const childList = treeFoldersByParent[n.id];
+    const hasNestedFolders = !!(childList && childList.filter((c: any) => c.node_type === 'folder').length);
+    const showArrow =
+      Object.prototype.hasOwnProperty.call(treeFoldersByParent, n.id) ? hasNestedFolders : true;
+    return `<div class="tree-item${currentParentId === n.id ? ' active' : ''}" data-id="${n.id}"><span class="ti-arrow${isOpen ? ' open' : ''}">${showArrow ? '&#9654;' : ''}</span><span class="ti-ic">&#128193;</span><span class="ti-name">${esc(n.name)}</span></div>${isOpen ? `<div class="tree-children">${renderTreeLevel(n.id, depth + 1)}</div>` : ''}`;
   }).join('');
 }
 function bindTreeItems() {
   document.querySelectorAll('.tree-item:not([data-bound])').forEach(item => {
-    (item as HTMLElement).dataset.bound='1';
-    item.addEventListener('click', () => {
-      const id=(item as HTMLElement).dataset.id!;
-      if(treeExpanded.has(id))treeExpanded.delete(id);else treeExpanded.add(id);
-      const nameEl=item.querySelector('.ti-name')||item;
-      pathStack=[{id:null,name:'Хранилище'},{id,name:nameEl.textContent!.trim()}];
-      currentParentId=id; loadTree(); loadFiles(id);
-      (document.getElementById('btn-back') as HTMLElement).style.display='flex';
+    (item as HTMLElement).dataset.bound = '1';
+    item.addEventListener('click', async () => {
+      const id = (item as HTMLElement).dataset.id!;
+      if (treeExpanded.has(id)) treeExpanded.delete(id);
+      else {
+        treeExpanded.add(id);
+        try {
+          await ensureFolderChildrenCached(id, id);
+        } catch (e: any) {
+          console.error(e);
+        }
+      }
+      const nameEl = item.querySelector('.ti-name') || item;
+      pathStack = [{ id: null, name: 'Хранилище' }, { id, name: nameEl.textContent!.trim() }];
+      currentParentId = id;
+      await loadTree();
+      loadFiles(id);
+      (document.getElementById('btn-back') as HTMLElement).style.display = 'flex';
     });
   });
 }
@@ -517,7 +561,7 @@ function setupSearch() {
 async function searchFiles(query: string) {
   currentView='search'; document.querySelectorAll('.nav-btn').forEach(b=>b.classList.remove('active'));
   const c=document.getElementById('content')!;
-  document.getElementById('bc')!.innerHTML=`<a>${t.vault}</a><span class="sep">/</span><a>Поиск: ${query}</a>`;
+  document.getElementById('bc')!.innerHTML=`<a>${t.vault}</a><span class="sep">/</span><a>Поиск: ${esc(query)}</a>`;
   const {data,error}=await sb.from('nodes').select('*').eq('is_deleted',false).ilike('name',`%${query}%`).order('name').limit(50);
   if(error){c.innerHTML=errMsg(error.message);return;}
   c.innerHTML=(data||[]).length===0?`<div class="empty"><div class="empty-ic">&#128269;</div><div class="empty-t">${t.no_results}</div></div>`:
@@ -567,7 +611,7 @@ function startRename(nodeId:string) {
   const nameEl=row.querySelector('.fr-name')!;const oldName=nameEl.textContent!;
   const input=document.createElement('input');input.className='rename-input';input.value=oldName;
   nameEl.replaceWith(input);input.focus();input.select();
-  const finish=async()=>{const newName=input.value.trim()||oldName;if(newName!==oldName){optimisticUpdateRow(nodeId,{name:newName});await sb.from('nodes').update({name:newName,updated_at:new Date().toISOString()}).eq('id',nodeId);await sb.from('audit_log').insert({id:uuidv4(),user_id:currentUser.id,node_id:nodeId,action:'node_rename',details:{old_name:oldName,new_name:newName}});cacheInvalidate('nodes:');toast(`${t.rename}: ${newName}`,'ok');loadTree();}loadView(currentView);};
+  const finish=async()=>{const newName=input.value.trim()||oldName;if(newName!==oldName){optimisticUpdateRow(nodeId,{name:newName});await sb.from('nodes').update({name:newName,updated_at:new Date().toISOString()}).eq('id',nodeId);await sb.from('audit_log').insert({id:uuidv4(),user_id:currentUser.id,node_id:nodeId,action:'node_rename',details:{old_name:oldName,new_name:newName}});invalidateNodesAndTreeCaches();toast(`${t.rename}: ${newName}`,'ok');loadTree();}loadView(currentView);};
   input.addEventListener('blur',finish);input.addEventListener('keydown',(e)=>{if(e.key==='Enter')input.blur();if(e.key==='Escape'){input.value=oldName;input.blur();}});
 }
 (window as any).startRename=startRename;
@@ -581,24 +625,25 @@ async function previewFile(nodeId:string) {
   const existing=document.getElementById('preview-panel');if(existing)existing.remove();
   const panel=document.createElement('div');panel.className='preview-panel';panel.id='preview-panel';
   let body='';
-  if(viewerType==='image'||node.mime_type?.startsWith('image/'))body=`<img src="https://images.pexels.com/photos/414612/pexels-photo-414612.jpeg?auto=compress&cs=tinysrgb&w=800" alt="${node.name}" />`;
-  else if(viewerType==='text')body=`<pre>[${node.name}]\nТип: ${node.mime_type||'?'}\nРазмер: ${fmtSize(node.size)}\nПросмотрщик: ${extConfig?.viewer_library||'текстовый'}</pre>`;
-  else if(viewerType==='iframe')body=`<iframe srcdoc="<html><body style='color:#1a1d26;background:#fff;font-family:sans-serif;padding:20px'><h3>${node.name}</h3><p>PDF preview</p></body></html>"></iframe>`;
-  else body=`<pre>[${node.name}]\nФормат .${ext} требует просмотрщик.\n${extConfig?.viewer_library?`Библиотека: ${extConfig.viewer_library}`:'Добавьте в Расширениях.'}</pre>`;
-  panel.innerHTML=`<div class="preview-content"><div class="preview-head"><div class="preview-title">${node.name}</div><button class="btn-sm" onclick="closePreview()">Закрыть</button></div><div class="preview-body">${body}</div></div>`;
+  if(viewerType==='image'||node.mime_type?.startsWith('image/'))body=`<img src="https://images.pexels.com/photos/414612/pexels-photo-414612.jpeg?auto=compress&cs=tinysrgb&w=800" alt="${esc(node.name)}" />`;
+  else if(viewerType==='text')body=`<pre>[${esc(node.name)}]\nТип: ${esc(node.mime_type||'?')}\nРазмер: ${fmtSize(node.size)}\nПросмотрщик: ${esc(extConfig?.viewer_library||'текстовый')}</pre>`;
+  else if(viewerType==='iframe')body=`<iframe srcdoc="<html><body style='color:#1a1d26;background:#fff;font-family:sans-serif;padding:20px'><h3>${esc(node.name)}</h3><p>PDF preview</p></body></html>"></iframe>`;
+  else body=`<pre>[${esc(node.name)}]\nФормат .${esc(ext)} требует просмотрщик.\n${extConfig?.viewer_library?`Библиотека: ${esc(extConfig.viewer_library)}`:'Добавьте в Расширениях.'}</pre>`;
+  panel.innerHTML=`<div class="preview-content"><div class="preview-head"><div class="preview-title">${esc(node.name)}</div><button class="btn-sm" onclick="closePreview()">Закрыть</button></div><div class="preview-body">${body}</div></div>`;
   document.body.appendChild(panel);panel.addEventListener('click',(e)=>{if(e.target===panel)closePreview();});
 }
 function closePreview(){const p=document.getElementById('preview-panel');if(p)p.remove();}
 (window as any).closePreview=closePreview;(window as any).previewFile=previewFile;
 
-// --- Collaboration (Realtime Presence) ---
-function startCollabPoll() {
+// --- Supabase Realtime: списки + presence (без polling) ---
+function setupRealtimeSubscriptions() {
   if (!realtimeSetup && currentUser) {
     realtimeSetup = true;
     joinPresence(sb, currentUser.id, { email: currentUser.email || '', fullName: currentUser.full_name || '' }, (users) => {
       renderCollabBar(users);
     });
     const debouncedReload = (prefixes: string[], reloader: () => void) => {
+      if (prefixes.some(p => p.startsWith('nodes'))) treeFoldersByParent = {};
       prefixes.forEach(p => cacheInvalidate(p));
       clearTimeout(realtimeDebounce);
       realtimeDebounce = setTimeout(reloader, 300);
@@ -651,12 +696,12 @@ async function loadProducts() {
     <div class="stats">${LIFECYCLE_STAGES.map(s=>`<div class="stat-card"><div class="stat-val">${stageCounts[s]||0}</div><div class="stat-lbl">${t[s as keyof typeof t]||s}</div></div>`).join('')}</div>
     <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:8px">
       ${products.map(p=>`<div class="product-card" data-id="${p.id}" onclick="openProductDetail('${p.id}')">
-        <div class="product-code">${p.code}</div>
-        <div class="product-name">${p.name}</div>
-        <div class="product-desc">${p.description||''}</div>
+        <div class="product-code">${esc(p.code)}</div>
+        <div class="product-name">${esc(p.name)}</div>
+        <div class="product-desc">${esc(p.description||'')}</div>
         <div class="product-meta">
           <span class="badge badge-stage">${t[p.lifecycle_stage as keyof typeof t]||p.lifecycle_stage}</span>
-          <span class="badge ${p.status==='active'?'badge-enc':p.status==='draft'?'badge-arch':'badge-comp'}">${p.status}</span>
+          <span class="badge ${p.status==='active'?'badge-enc':p.status==='draft'?'badge-arch':'badge-comp'}">${esc(p.status)}</span>
         </div>
       </div>`).join('')}
     </div>`;
@@ -667,7 +712,7 @@ async function loadProducts() {
   const c=document.getElementById('content')!;
   c.querySelectorAll('.product-card').forEach(el=>el.remove());
   const grid=c.querySelector('[style*="grid"]')!;
-  (data||[]).forEach(p=>{const d=document.createElement('div');d.className='product-card';d.dataset.id=p.id;d.onclick=()=>openProductDetail(p.id);d.innerHTML=`<div class="product-code">${p.code}</div><div class="product-name">${p.name}</div><div class="product-desc">${p.description||''}</div><div class="product-meta"><span class="badge badge-stage">${t[p.lifecycle_stage as keyof typeof t]||p.lifecycle_stage}</span><span class="badge ${p.status==='active'?'badge-enc':'badge-arch'}">${p.status}</span></div>`;grid.appendChild(d);});
+  (data||[]).forEach(p=>{const d=document.createElement('div');d.className='product-card';d.dataset.id=p.id;d.onclick=()=>openProductDetail(p.id);d.innerHTML=`<div class="product-code">${esc(p.code)}</div><div class="product-name">${esc(p.name)}</div><div class="product-desc">${esc(p.description||'')}</div><div class="product-meta"><span class="badge badge-stage">${t[p.lifecycle_stage as keyof typeof t]||p.lifecycle_stage}</span><span class="badge ${p.status==='active'?'badge-enc':'badge-arch'}">${esc(p.status)}</span></div>`;grid.appendChild(d);});
 };
 
 async function openProductDetail(productId: string) {
@@ -683,8 +728,8 @@ async function openProductDetail(productId: string) {
   const stageIdx=LIFECYCLE_STAGES.indexOf(product.lifecycle_stage);
   panel.innerHTML=`
     <div class="detail-head">
-      <div class="detail-name">${product.name}</div>
-      <div class="detail-sub">${product.code} &middot; ${t[product.lifecycle_stage as keyof typeof t]||product.lifecycle_stage} &middot; ${product.status}</div>
+      <div class="detail-name">${esc(product.name)}</div>
+      <div class="detail-sub">${esc(product.code)} &middot; ${t[product.lifecycle_stage as keyof typeof t]||product.lifecycle_stage} &middot; ${esc(product.status)}</div>
     </div>
     <div class="detail-actions">
       <button class="btn-sm" onclick="changeLifecycleStage('${productId}','prev')">&#8592;</button>
@@ -694,23 +739,23 @@ async function openProductDetail(productId: string) {
     </div>
     <div class="detail-sec">
       <div class="detail-sec-title">${t.description}</div>
-      <div style="font-size:12px;color:var(--text-1)">${product.description||'-'}</div>
-      ${Object.keys(product.metadata||{}).length>0?`<div style="margin-top:6px;font-size:11px;color:var(--text-2)">${Object.entries(product.metadata).map(([k,v])=>`<div><span style="color:var(--text-3)">${k}:</span> ${v}</div>`).join('')}</div>`:''}
+      <div style="font-size:12px;color:var(--text-1)">${esc(product.description||'-')}</div>
+      ${Object.keys(product.metadata||{}).length>0?`<div style="margin-top:6px;font-size:11px;color:var(--text-2)">${Object.entries(product.metadata).map(([k,v])=>`<div><span style="color:var(--text-3)">${esc(String(k))}:</span> ${esc(String(v))}</div>`).join('')}</div>`:''}
     </div>
     <div class="detail-sec">
       <div class="detail-sec-title">${t.workflow} <span class="detail-sec-count">${wfs.length}</span></div>
       ${wfs.length===0?'<div style="font-size:11px;color:var(--text-3)">Нет активных маршрутов</div>':
-        wfs.map((w:any)=>`<div style="padding:4px 0;border-bottom:1px solid var(--bg-2);font-size:11px"><span style="font-weight:600">${esc(w.workflow_stages?.name||'?')}</span> &middot; <span class="badge ${w.status==='completed'?'badge-enc':w.status==='rejected'?'badge-arch':'badge-stage'}">${w.status}</span> &middot; ${esc(w.user_profiles?.full_name||w.user_profiles?.email||'?')}${w.comment?` &middot; ${esc(w.comment)}`:''}</div>`).join('')}
+        wfs.map((w:any)=>`<div style="padding:4px 0;border-bottom:1px solid var(--bg-2);font-size:11px"><span style="font-weight:600">${esc(w.workflow_stages?.name||'?')}</span> &middot; <span class="badge ${w.status==='completed'?'badge-enc':w.status==='rejected'?'badge-arch':'badge-stage'}">${esc(w.status)}</span> &middot; ${esc(w.user_profiles?.full_name||w.user_profiles?.email||'?')}${w.comment?` &middot; ${esc(w.comment)}`:''}</div>`).join('')}
     </div>
     <div class="detail-sec">
       <div class="detail-sec-title">${t.bom_items} <span class="detail-sec-count">${bom.length}</span></div>
       ${bom.length===0?'<div style="font-size:11px;color:var(--text-3)">Нет компонентов</div>':
-        bom.map((b:any)=>`<div class="bom-row"><span class="bom-qty">${b.quantity}</span><span class="bom-unit">${b.unit}</span><span style="font-weight:500">${b.child?.code||'?'} ${b.child?.name||''}</span>${b.reference?`<span class="bom-ref">${b.reference}</span>`:''}</div>`).join('')}
+        bom.map((b:any)=>`<div class="bom-row"><span class="bom-qty">${b.quantity}</span><span class="bom-unit">${esc(b.unit)}</span><span style="font-weight:500">${esc(b.child?.code||'?')} ${esc(b.child?.name||'')}</span>${b.reference?`<span class="bom-ref">${esc(b.reference)}</span>`:''}</div>`).join('')}
       <button class="btn-sm" style="width:100%;margin-top:6px;justify-content:center" onclick="openAddBomModal('${productId}')">+ ${t.add_to_bom}</button>
     </div>
     <div class="detail-sec">
       <div class="detail-sec-title">Документы <span class="detail-sec-count">${docs.length}</span></div>
-      ${docs.map((d:any)=>`<div style="padding:4px 0;border-bottom:1px solid var(--bg-2);font-size:11px"><span style="font-weight:500">${d.nodes?.name||'?'}</span> <span class="badge badge-stage">${d.document_type}</span></div>`).join('')}
+      ${docs.map((d:any)=>`<div style="padding:4px 0;border-bottom:1px solid var(--bg-2);font-size:11px"><span style="font-weight:500">${esc(d.nodes?.name||'?')}</span> <span class="badge badge-stage">${esc(d.document_type)}</span></div>`).join('')}
     </div>`;
 }
 
@@ -762,7 +807,7 @@ async function openProductDetail(productId: string) {
   const m=document.getElementById('modal')!;
   m.innerHTML=`<div class="modal-head"><div class="modal-title">${t.add_to_bom}</div><button class="modal-x" onclick="closeModal()">&times;</button></div>
     <div class="modal-body">
-      <div class="fg"><label>Компонент</label><select id="m-bom-child">${(products||[]).map((p:any)=>`<option value="${p.id}">${p.code} - ${p.name}</option>`).join('')}</select></div>
+      <div class="fg"><label>Компонент</label><select id="m-bom-child">${(products||[]).map((p:any)=>`<option value="${p.id}">${esc(p.code)} - ${esc(p.name)}</option>`).join('')}</select></div>
       <div class="fg"><label>Количество</label><input id="m-bom-qty" type="number" value="1" /></div>
       <div class="fg"><label>Единица</label><select id="m-bom-unit"><option>pcs</option><option>kg</option><option>m</option><option>l</option></select></div>
       <div class="fg"><label>Позиция</label><input id="m-bom-ref" placeholder="R1, C2..." /></div>
@@ -856,8 +901,8 @@ function bindFileRows() {
 // --- Upload ---
 function setupDropZone(){const zone=document.getElementById('drop-zone'),input=document.getElementById('file-input') as HTMLInputElement;if(!zone)return;zone.addEventListener('click',()=>input.click());zone.addEventListener('dragover',e=>{e.preventDefault();zone.classList.add('dragover');});zone.addEventListener('dragleave',()=>zone.classList.remove('dragover'));zone.addEventListener('drop',e=>{e.preventDefault();zone.classList.remove('dragover');handleFiles(e.dataTransfer!.files);});input.onchange=()=>{if(input.files)handleFiles(input.files);input.value='';};}
 async function handleFiles(fileList:FileList){for(const file of fileList)uploadQueue.push({file,progress:0});if(!isUploading)processUploadQueue();}
-async function processUploadQueue(){if(uploadQueue.length===0){isUploading=false;return;}isUploading=true;renderUploadProgress();while(uploadQueue.length>0){const item=uploadQueue[0];try{await uploadFileWithProgress(item);toast(`${t.upload_complete}: ${item.file.name}`,'ok');}catch(e:any){toast(`${t.upload_failed}: ${item.file.name}`,'err');}uploadQueue.shift();renderUploadProgress();}isUploading=false;cacheInvalidate('nodes:');loadFiles(currentParentId);loadTree();}
-function renderUploadProgress(){const el=document.getElementById('upload-progress');if(!el)return;if(uploadQueue.length===0){el.innerHTML='';return;}el.innerHTML=uploadQueue.map(item=>`<div style="background:var(--bg-1);border:1px solid var(--border);border-radius:var(--r);padding:4px 10px;margin-bottom:3px;display:flex;align-items:center;gap:6px"><span style="font-size:11px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${item.file.name}</span><div class="progress-bar" style="width:60px"><div class="progress-fill" style="width:${item.progress}%"></div></div><span style="font-size:10px;color:var(--accent);width:28px;text-align:right">${item.progress}%</span></div>`).join('');}
+async function processUploadQueue(){if(uploadQueue.length===0){isUploading=false;return;}isUploading=true;renderUploadProgress();while(uploadQueue.length>0){const item=uploadQueue[0];try{await uploadFileWithProgress(item);toast(`${t.upload_complete}: ${item.file.name}`,'ok');}catch(e:any){toast(`${t.upload_failed}: ${item.file.name}`,'err');}uploadQueue.shift();renderUploadProgress();}isUploading=false;invalidateNodesAndTreeCaches();loadFiles(currentParentId);loadTree();}
+function renderUploadProgress(){const el=document.getElementById('upload-progress');if(!el)return;if(uploadQueue.length===0){el.innerHTML='';return;}el.innerHTML=uploadQueue.map(item=>`<div style="background:var(--bg-1);border:1px solid var(--border);border-radius:var(--r);padding:4px 10px;margin-bottom:3px;display:flex;align-items:center;gap:6px"><span style="font-size:11px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(item.file.name)}</span><div class="progress-bar" style="width:60px"><div class="progress-fill" style="width:${item.progress}%"></div></div><span style="font-size:10px;color:var(--accent);width:28px;text-align:right">${item.progress}%</span></div>`).join('');}
 async function uploadFileWithProgress(item:{file:File;progress:number}){if(!currentUser)throw new Error('No user');const file=item.file;const buf=await file.arrayBuffer();const size=buf.byteLength;const id=uuidv4();item.progress=20;renderUploadProgress();const{error:nodeErr}=await sb.from('nodes').insert({id,parent_id:currentParentId,owner_id:currentUser.id,name:file.name,node_type:'file',path:`/${file.name}`,mime_type:file.type||'application/octet-stream',size});if(nodeErr)throw nodeErr;item.progress=40;renderUploadProgress();const hashBuf=await crypto.subtle.digest('SHA-256',buf);const hash=Array.from(new Uint8Array(hashBuf)).map(b=>b.toString(16).padStart(2,'0')).join('');item.progress=60;renderUploadProgress();const vid=uuidv4();await sb.from('file_versions').insert({id:vid,node_id:id,version_number:1,total_size:size,content_hash:hash,encrypted_key:new Uint8Array(32),key_nonce:new Uint8Array(24),is_current:true,is_compressed:false,created_by:currentUser.id,comment:'Загружен'});item.progress=75;renderUploadProgress();const bid=uuidv4();await sb.from('data_blocks').insert({id:bid,content_hash:hash,encrypted_hash:hash,size,encrypted_size:size+16,physical_path:`/vault/blocks/${hash.substring(0,2)}/${hash}`,compression:'none',ref_count:1});await sb.from('file_version_blocks').insert({id:uuidv4(),version_id:vid,block_id:bid,block_index:0,block_offset:0});item.progress=90;renderUploadProgress();await sb.from('audit_log').insert({id:uuidv4(),user_id:currentUser.id,node_id:id,action:'version_create',details:{version_number:1,size}});item.progress=100;renderUploadProgress();}
 (window as any).triggerUpload=()=>{(document.getElementById('file-input') as HTMLInputElement).click();};
 (window as any).createFolder=async()=>{
@@ -869,7 +914,7 @@ async function uploadFileWithProgress(item:{file:File;progress:number}){if(!curr
   try{
     const{error}=await sb.from('nodes').insert({id,parent_id:currentParentId,owner_id:currentUser.id,name,node_type:'folder',path:`/${name}`,size:0});
     if(error){toast(error.message,'err');loadFiles(currentParentId);return;}
-    cacheInvalidate('nodes:');
+    invalidateNodesAndTreeCaches();
     toast(t.folder_created,'ok');
     loadTree();
     loadFiles(currentParentId);
@@ -880,14 +925,14 @@ async function uploadFileWithProgress(item:{file:File;progress:number}){if(!curr
 };
 
 // --- Breadcrumb ---
-function updateBreadcrumb(){document.getElementById('bc')!.innerHTML=pathStack.map((p,i)=>`<a onclick="navTo(${i})">${p.name}</a>${i<pathStack.length-1?'<span class="sep">/</span>':''}`).join('');}
+function updateBreadcrumb(){document.getElementById('bc')!.innerHTML=pathStack.map((p,i)=>`<a onclick="navTo(${i})">${esc(p.name)}</a>${i<pathStack.length-1?'<span class="sep">/</span>':''}`).join('');}
 (window as any).navTo=(idx:number)=>{pathStack=pathStack.slice(0,idx+1);currentParentId=pathStack[idx].id;loadFiles(currentParentId);(document.getElementById('btn-back') as HTMLElement).style.display=pathStack.length>1?'flex':'none';};
 
 // --- Detail ---
 async function openDetail(nodeId:string) {
   selectedNodeId=nodeId;const panel=document.getElementById('detail')!;panel.style.display='flex';
   const{data:node}=await sb.from('nodes').select('*').eq('id',nodeId).maybeSingle();if(!node)return;
-  panel.innerHTML=`<div class="detail-head"><div class="detail-name">${node.name}</div><div class="detail-sub">${node.mime_type||'Файл'} &middot; ${fmtSize(node.size)}</div></div><div style="padding:14px;color:var(--text-3)">Загрузка...</div>`;
+  panel.innerHTML=`<div class="detail-head"><div class="detail-name">${esc(node.name)}</div><div class="detail-sub">${esc(node.mime_type||'Файл')} &middot; ${fmtSize(node.size)}</div></div><div style="padding:14px;color:var(--text-3)">Загрузка...</div>`;
   const[verRes,aclRes,shrRes,commentsRes]=await Promise.all([
     sb.from('file_versions').select('*').eq('node_id',nodeId).order('version_number',{ascending:false}),
     sb.from('access_control_lists').select('*, user_profiles(email, full_name)').eq('node_id',nodeId),
@@ -897,7 +942,7 @@ async function openDetail(nodeId:string) {
   const versions=verRes.data||[];const acls=aclRes.data||[];const shares=shrRes.data||[];const comments=commentsRes.data||[];
   const isOwner=node.owner_id===currentUser?.id;const currentVer=versions.find((v:any)=>v.is_current);
   panel.innerHTML=`
-    <div class="detail-head"><div class="detail-name">${node.name}</div><div class="detail-sub">${node.mime_type||'Файл'} &middot; ${fmtSize(node.size)} &middot; ${fmtDate(node.created_at)}</div></div>
+    <div class="detail-head"><div class="detail-name">${esc(node.name)}</div><div class="detail-sub">${esc(node.mime_type||'Файл')} &middot; ${fmtSize(node.size)} &middot; ${fmtDate(node.created_at)}</div></div>
     <div class="detail-actions">
       ${node.node_type==='file'?`<button class="btn-sm" onclick="previewFile('${nodeId}')">&#128065; ${t.preview}</button><button class="btn-sm" onclick="downloadFile('${nodeId}')">&#11015; ${t.download}</button>${!node.is_archived?`<button class="btn-sm" onclick="archiveFile('${nodeId}')">&#128230; ${t.archive_btn}</button>`:`<button class="btn-sm" onclick="unarchiveFileAction('${nodeId}')">&#128193; ${t.unarchive_btn}</button>`}<button class="btn-sm" onclick="lockFile('${nodeId}')">&#128274; Lock</button>`:''}
       <button class="btn-sm" onclick="startRename('${nodeId}')" style="margin-left:auto">&#9998; ${t.rename}</button>
@@ -918,9 +963,9 @@ async function openDetail(nodeId:string) {
 }
 
 (window as any).addComment=async(versionId:string)=>{const input=document.getElementById('new-comment') as HTMLInputElement;const comment=input.value.trim();if(!comment)return;await sb.from('version_comments').insert({id:uuidv4(),version_id:versionId,user_id:currentUser.id,comment});toast(t.comment,'ok');if(selectedNodeId)openDetail(selectedNodeId);};
-(window as any).deleteFile=async(nodeId:string)=>{if(!confirm(t.delete_confirm))return;optimisticRemoveRow(nodeId);try{await softDeleteNode(nodeId,currentUser.id);cacheInvalidate('nodes:');toast(t.delete,'ok');document.getElementById('detail')!.style.display='none';loadTree();if(currentView==='files')loadFiles(currentParentId);}catch(e:any){toast(e.message,'err');loadView(currentView);}};
-(window as any).archiveFile=async(nodeId:string)=>{optimisticRemoveRow(nodeId);try{await sb.from('nodes').update({is_archived:true,updated_at:new Date().toISOString()}).eq('id',nodeId);await sb.from('audit_log').insert({id:uuidv4(),user_id:currentUser.id,node_id:nodeId,action:'archive_files',details:{}});cacheInvalidate('nodes:');toast(t.archive_btn,'ok');document.getElementById('detail')!.style.display='none';loadTree();if(currentView==='files')loadFiles(currentParentId);}catch(e:any){toast(e.message,'err');loadView(currentView);}};
-(window as any).unarchiveFileAction=async(nodeId:string)=>{try{await unarchiveFile(nodeId);cacheInvalidate('nodes:');toast(t.unarchive_btn,'ok');if(currentView==='archived')loadArchived();else if(currentView==='files')loadFiles(currentParentId);loadTree();}catch(e:any){toast(e.message,'err');}};
+(window as any).deleteFile=async(nodeId:string)=>{if(!confirm(t.delete_confirm))return;optimisticRemoveRow(nodeId);try{await softDeleteNode(nodeId,currentUser.id);invalidateNodesAndTreeCaches();toast(t.delete,'ok');document.getElementById('detail')!.style.display='none';loadTree();if(currentView==='files')loadFiles(currentParentId);}catch(e:any){toast(e.message,'err');loadView(currentView);}};
+(window as any).archiveFile=async(nodeId:string)=>{optimisticRemoveRow(nodeId);try{await sb.from('nodes').update({is_archived:true,updated_at:new Date().toISOString()}).eq('id',nodeId);await sb.from('audit_log').insert({id:uuidv4(),user_id:currentUser.id,node_id:nodeId,action:'archive_files',details:{}});invalidateNodesAndTreeCaches();toast(t.archive_btn,'ok');document.getElementById('detail')!.style.display='none';loadTree();if(currentView==='files')loadFiles(currentParentId);}catch(e:any){toast(e.message,'err');loadView(currentView);}};
+(window as any).unarchiveFileAction=async(nodeId:string)=>{try{await unarchiveFile(nodeId);invalidateNodesAndTreeCaches();toast(t.unarchive_btn,'ok');if(currentView==='archived')loadArchived();else if(currentView==='files')loadFiles(currentParentId);loadTree();}catch(e:any){toast(e.message,'err');}};
 (window as any).downloadFile=async(nodeId:string)=>{const{data:node}=await sb.from('nodes').select('name,mime_type').eq('id',nodeId).maybeSingle();if(!node)return;const blob=new Blob([`Vault PLM placeholder: ${node.name}`],{type:node.mime_type||'application/octet-stream'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=node.name;a.click();URL.revokeObjectURL(url);};
 (window as any).lockFile=async(nodeId:string)=>{try{const result=await acquireFileLock(nodeId,currentUser.id,30000);if(result.acquired)toast(t.lock_acquired,'ok');else toast(t.lock_failed,'err');}catch(e:any){toast(e.message,'err');}};
 (window as any).restoreVer=async(nodeId:string,vn:number)=>{try{await restoreFileVersion(nodeId,vn,currentUser.id);toast(`${t.version_restored}: v${vn}`,'ok');openDetail(nodeId);}catch(e:any){toast(e.message,'err');}};
@@ -937,14 +982,14 @@ let shareNodeId:string|null=null;
 
 // --- Trash ---
 async function loadTrash(){const c=document.getElementById('content')!;const nodes=await dedupFetch('nodes:trash',async()=>{const{data,error}=await sb.from('nodes').select('*').eq('is_deleted',true).order('deleted_at',{ascending:false});if(error)throw new Error(error.message);return data||[];});updateBreadcrumbView(t.trash);c.innerHTML=nodes.length===0?`<div class="empty"><div class="empty-ic">&#128465;</div><div class="empty-t">${t.no_trash}</div></div>`:`<div class="file-list">${nodes.map((n: any)=>`<div class="file-row" data-id="${n.id}" data-type="${n.node_type}"><div class="fr-icon file">${n.node_type==='folder'?'&#128193;':'&#128196;'}</div><div class="fr-name">${esc(n.name)}</div><div class="fr-size">${fmtSize(n.size)}</div><div class="fr-date">${fmtDate(n.deleted_at)}</div><div class="fr-actions"><button onclick="event.stopPropagation();restoreFromTrash('${n.id}')">${t.restore}</button></div></div>`).join('')}</div>`;}
-(window as any).restoreFromTrash=async(nodeId:string)=>{await sb.from('nodes').update({is_deleted:false,deleted_at:null,updated_at:new Date().toISOString()}).eq('id',nodeId);cacheInvalidate('nodes:');toast(t.restore,'ok');loadTrash();loadTree();if(currentView==='files')loadFiles(currentParentId);};
+(window as any).restoreFromTrash=async(nodeId:string)=>{await sb.from('nodes').update({is_deleted:false,deleted_at:null,updated_at:new Date().toISOString()}).eq('id',nodeId);invalidateNodesAndTreeCaches();toast(t.restore,'ok');loadTrash();loadTree();if(currentView==='files')loadFiles(currentParentId);};
 (window as any).purgeTrash=async()=>{try{const count=await purgeDeletedNodes(0);toast(`${t.purge_done}: ${count}`,'ok');loadTrash();}catch(e:any){toast(e.message,'err');}};
 
 // --- Recent ---
 async function loadRecent(){const c=document.getElementById('content')!;const data=await dedupFetch('nodes:recent',async()=>{const{data,error}=await sb.from('nodes').select('*').eq('is_deleted',false).eq('is_archived',false).eq('node_type','file').order('updated_at',{ascending:false}).limit(20);if(error)throw new Error(error.message);return data||[];});updateBreadcrumbView(t.recent);c.innerHTML=`<div class="file-list-header"><div class="fh-name">${t.name}</div><div class="fh-size">${t.size}</div><div class="fh-date">${t.date}</div></div><div class="file-list">${(data||[]).map((n: any)=>fileRow(n)).join('')}</div>`;bindFileRows();}
 
 // --- Shared ---
-async function loadShared(){const c=document.getElementById('content')!;const data=await dedupFetch('share_links:list',async()=>{const{data,error}=await sb.from('share_links').select('*, nodes(name)').order('created_at',{ascending:false});if(error)throw new Error(error.message);return data||[];});updateBreadcrumbView(t.shared);c.innerHTML=(data||[]).length===0?`<div class="empty"><div class="empty-ic">&#128279;</div><div class="empty-t">${t.no_links}</div></div>`:`<table class="tbl"><thead><tr><th>${t.name}</th><th>Токен</th><th>${t.permission}</th><th>${t.accesses}</th><th></th></tr></thead><tbody>${(data||[]).map((l: any)=>`<tr><td>${l.nodes?.name||'?'}</td><td><span class="share-tok">${l.token.substring(0,16)}...</span></td><td>${l.permission}</td><td>${l.access_count}</td><td>${l.is_active?`<button class="btn-sm danger" onclick="revokeShare('${l.id}','${l.node_id}')">${t.revoke}</button>`:''}</td></tr>`).join('')}</tbody></table>`;}
+async function loadShared(){const c=document.getElementById('content')!;const data=await dedupFetch('share_links:list',async()=>{const{data,error}=await sb.from('share_links').select('*, nodes(name)').order('created_at',{ascending:false});if(error)throw new Error(error.message);return data||[];});updateBreadcrumbView(t.shared);c.innerHTML=(data||[]).length===0?`<div class="empty"><div class="empty-ic">&#128279;</div><div class="empty-t">${t.no_links}</div></div>`:`<table class="tbl"><thead><tr><th>${t.name}</th><th>Токен</th><th>${t.permission}</th><th>${t.accesses}</th><th></th></tr></thead><tbody>${(data||[]).map((l: any)=>`<tr><td>${esc(l.nodes?.name||'?')}</td><td><span class="share-tok">${l.token.substring(0,16)}...</span></td><td>${esc(l.permission)}</td><td>${l.access_count}</td><td>${l.is_active?`<button class="btn-sm danger" onclick="revokeShare('${l.id}','${l.node_id}')">${t.revoke}</button>`:''}</td></tr>`).join('')}</tbody></table>`;}
 
 // --- Archived ---
 async function loadArchived(){const c=document.getElementById('content')!;const data=await dedupFetch('nodes:archived',async()=>{const{data,error}=await sb.from('nodes').select('*').eq('is_archived',true).eq('is_deleted',false).order('updated_at',{ascending:false});if(error)throw new Error(error.message);return data||[];});updateBreadcrumbView(t.archive);c.innerHTML=`<div class="file-list">${(data||[]).map((n: any)=>fileRow(n)).join('')}</div>`;bindFileRows();}
@@ -979,7 +1024,7 @@ async function loadAdmin(){const c=document.getElementById('content')!;updateBre
 (window as any).openAddUserModal=()=>{const m=document.getElementById('modal')!;m.innerHTML=`<div class="modal-head"><div class="modal-title">${t.add_user}</div><button class="modal-x" onclick="closeModal()">&times;</button></div><div class="modal-body"><div class="fg"><label>${t.email}</label><input id="m-uname" type="email" placeholder="user@company.com" /></div><div class="fg"><label>${t.password}</label><input id="m-upw" type="password" placeholder="Минимум 6 символов" /></div><div class="fg"><label>${t.full_name}</label><input id="m-ufname" placeholder="Иванов И.И." /></div><div class="fg"><label>${t.role}</label><select id="m-role"><option value="viewer">viewer</option><option value="editor">editor</option><option value="auditor">auditor</option><option value="owner">owner</option></select></div></div><div class="modal-foot"><button class="btn-sm" onclick="closeModal()">${t.cancel}</button><button class="btn-sm primary" onclick="submitAddUser()">${t.create}</button></div>`;document.getElementById('modal-overlay')!.classList.add('open');};
 (window as any).submitAddUser=async()=>{const email=(document.getElementById('m-uname') as HTMLInputElement).value.trim();const pw=(document.getElementById('m-upw') as HTMLInputElement).value;const fname=(document.getElementById('m-ufname') as HTMLInputElement).value.trim();const role=(document.getElementById('m-role') as HTMLSelectElement).value;if(!email||!pw){toast('Укажите email и пароль','err');return;}const{error}=await sb.auth.signUp({email,password:pw,options:{data:{full_name:fname,role}}});(window as any).closeModal();if(error)toast('Ошибка: '+error.message,'err');else{toast(t.user_added,'ok');loadAdmin();}};
 (window as any).deleteUser=async(id:string)=>{if(!confirm('Удалить пользователя?'))return;const{error}=await sb.from('user_profiles').delete().eq('id',id);if(error){toast(error.message,'err');return;}loadAdmin();};
-(window as any).runArchive=async()=>{showLoading(t.run_archive);try{const result=await archiveOldVersions({versionAgeDays:90,fileIdleDays:180,compressionAlgorithm:'zstd',batchSize:100},currentUser?.id);cacheInvalidate('nodes:');toast(`${t.archive_done}: ${result.versionsArchived} версий`,'ok');loadAdmin();}catch(e:any){toast(e.message,'err');}finally{hideLoading();}};
+(window as any).runArchive=async()=>{showLoading(t.run_archive);try{const result=await archiveOldVersions({versionAgeDays:90,fileIdleDays:180,compressionAlgorithm:'zstd',batchSize:100},currentUser?.id);invalidateNodesAndTreeCaches();toast(`${t.archive_done}: ${result.versionsArchived} версий`,'ok');loadAdmin();}catch(e:any){toast(e.message,'err');}finally{hideLoading();}};
 
 // --- Server/Connection config ---
 async function loadServer(){const c=document.getElementById('content')!;updateBreadcrumbView(t.connection);const[connRes,serverRes]=await Promise.all([sb.from('connection_config').select('*').order('key'),sb.from('server_config').select('*').order('key')]);const conn=connRes.data||[];const server=serverRes.data||[];
@@ -1106,22 +1151,41 @@ async function loadSecurity() {
 
 // --- Backups & Integrity ---
 const VAULT_API = `${SUPABASE_URL}/functions/v1/vault`;
-const vaultHeaders = () => ({
-  'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-  'Content-Type': 'application/json',
-});
+/** Edge Function: JWT пользователя + apikey (не анонимный ключ как Bearer). */
+async function vaultHeaders(): Promise<Record<string, string>> {
+  const { data: { session } } = await sb.auth.getSession();
+  const token = session?.access_token;
+  if (!token) throw new Error('Нет сессии');
+  return {
+    Authorization: `Bearer ${token}`,
+    apikey: SUPABASE_ANON_KEY,
+    'Content-Type': 'application/json',
+  };
+}
 
 async function loadBackups() {
   const c = document.getElementById('content')!;
   updateBreadcrumbView(t.backups);
 
-  const [backupsRes, integrityRes] = await Promise.all([
-    fetch(`${VAULT_API}/backups`, { headers: vaultHeaders() }).then(r => r.json()).catch(() => []),
-    sb.from('file_integrity_checks').select('*, nodes(name)').order('checked_at', { ascending: false }).limit(20),
-  ]);
-
-  const backups = Array.isArray(backupsRes) ? backupsRes : [];
-  const checks = integrityRes.data || [];
+  let backups: any[] = [];
+  let checks: any[] = [];
+  try {
+    const h = await vaultHeaders();
+    const [backupsJson, integrityRes] = await Promise.all([
+      fetch(`${VAULT_API}/backups`, { headers: h }).then((r) => r.json()),
+      sb.from('file_integrity_checks').select('*, nodes(name)').order('checked_at', { ascending: false }).limit(20),
+    ]);
+    backups = Array.isArray(backupsJson) ? backupsJson : [];
+    checks = integrityRes.data || [];
+  } catch {
+    backups = [];
+    try {
+      const { data } = await sb.from('file_integrity_checks').select('*, nodes(name)').order('checked_at', { ascending: false }).limit(20);
+      checks = data || [];
+    } catch {
+      checks = [];
+    }
+  }
 
   c.innerHTML = `
     <div class="section-header"><div class="section-title">${t.backups}</div>
@@ -1154,11 +1218,11 @@ async function loadBackups() {
     ${checks.length === 0 ? `<div style="color:var(--text-3);font-size:12px;padding:12px">Проверки целостности не проводились</div>` :
       `<table class="tbl"><thead><tr><th>${t.name}</th><th>Версия</th><th>${t.backup_status}</th><th>${t.date}</th><th>Детали</th></tr></thead><tbody>
       ${checks.map((ch: any) => `<tr>
-        <td style="font-size:11px">${ch.nodes?.name || ch.node_id?.substring(0,8)}</td>
+        <td style="font-size:11px">${esc(ch.nodes?.name || ch.node_id?.substring(0,8) || '')}</td>
         <td style="font-size:11px">${ch.version_id?.substring(0,8)}</td>
         <td>${ch.is_valid ? '<span style="color:var(--green)">&#10003; OK</span>' : '<span style="color:var(--red)">&#10007; FAIL</span>'}</td>
         <td style="font-size:11px">${fmtDate(ch.checked_at)}</td>
-        <td style="font-size:10px;color:var(--text-3)">${ch.error_detail || '-'}</td>
+        <td style="font-size:10px;color:var(--text-3)">${esc(ch.error_detail || '-')}</td>
       </tr>`).join('')}
       </tbody></table>`}`;
 }
@@ -1187,8 +1251,8 @@ async function loadBackups() {
   try {
     const res = await fetch(`${VAULT_API}/backups`, {
       method: 'POST',
-      headers: vaultHeaders(),
-      body: JSON.stringify({ user_id: currentUser?.id, type }),
+      headers: await vaultHeaders(),
+      body: JSON.stringify({ type }),
     });
     const data = await res.json();
     if (data.error) { toast(data.error, 'err'); return; }
@@ -1203,7 +1267,7 @@ async function loadBackups() {
   try {
     const res = await fetch(`${VAULT_API}/backups/verify`, {
       method: 'POST',
-      headers: vaultHeaders(),
+      headers: await vaultHeaders(),
       body: JSON.stringify({ backup_id: id }),
     });
     const data = await res.json();
@@ -1220,12 +1284,12 @@ async function loadBackups() {
   try {
     const res = await fetch(`${VAULT_API}/backups/restore`, {
       method: 'POST',
-      headers: vaultHeaders(),
-      body: JSON.stringify({ user_id: currentUser?.id, backup_id: id }),
+      headers: await vaultHeaders(),
+      body: JSON.stringify({ backup_id: id }),
     });
     const data = await res.json();
     if (data.error) { toast(data.error, 'err'); return; }
-    cacheInvalidate('nodes:');
+    invalidateNodesAndTreeCaches();
     toast(t.backup_restored, 'ok');
     loadBackups();
   } catch (e: any) { toast(e.message, 'err'); }
@@ -1242,8 +1306,8 @@ async function loadBackups() {
     for (const node of nodes) {
       const res = await fetch(`${VAULT_API}/integrity-check`, {
         method: 'POST',
-        headers: vaultHeaders(),
-        body: JSON.stringify({ user_id: currentUser?.id, node_id: node.id }),
+        headers: await vaultHeaders(),
+        body: JSON.stringify({ node_id: node.id }),
       });
       const data = await res.json();
       if (data.all_valid === false) issues++;
@@ -1261,7 +1325,7 @@ function fmtDate(d:string):string{if(!d)return'--';return new Date(d).toLocaleDa
 function fmtAction(a:string):string{const map:Record<string,string>={version_create:'Создание версии',version_restore:'Восстановление',acl_grant:'Выдача прав',acl_revoke:'Отзыв прав',share_link_create:'Создание ссылки',share_link_revoke:'Отзыв ссылки',node_soft_delete:'Удаление',node_rename:'Переименование',archive_versions:'Архивация',archive_files:'Архивация файлов',file_lock:'Блокировка',file_unlock:'Разблокировка',conflict_resolve:'Разрешение конфликта',lifecycle_change:'Смена этапа ЖЦ',workflow_start:'Запуск маршрута',deploy_start:'Развертывание'};return map[a]||a.replace(/_/g,' ');}
 function fileIcon(mime:string|null):string{if(!mime)return'&#128196;';if(mime.startsWith('image/'))return'&#128444;';if(mime.includes('pdf'))return'&#128213;';if(mime.includes('word')||mime.includes('doc'))return'&#128209;';if(mime.includes('sheet')||mime.includes('xls')||mime.includes('csv'))return'&#128202;';return'&#128196;';}
 function fileIconCls(mime:string|null):string{if(!mime)return'file';if(mime.startsWith('image/'))return'img';if(mime.includes('pdf')||mime.includes('word')||mime.includes('doc'))return'doc';return'file';}
-function errMsg(msg:string):string{return`<div class="empty"><div class="empty-ic">&#9888;</div><div class="empty-t">Ошибка</div><div class="empty-d">${msg}</div></div>`;}
+function errMsg(msg:string):string{return`<div class="empty"><div class="empty-ic">&#9888;</div><div class="empty-t">Ошибка</div><div class="empty-d">${esc(msg)}</div></div>`;}
 function updateBreadcrumbView(name:string){document.getElementById('bc')!.innerHTML=`<a>${t.vault}</a><span class="sep">/</span><a>${name}</a>`;}
 function toast(msg:string,type:'ok'|'err'){const c=document.getElementById('toasts')!;const d=document.createElement('div');d.className=`toast ${type}`;d.innerHTML=`<span>${type==='ok'?'&#10003;':'&#10007;'}</span> ${msg}`;c.appendChild(d);setTimeout(()=>{d.style.opacity='0';d.style.transform='translateX(100%)';d.style.transition='all .2s';setTimeout(()=>d.remove(),200);},3000);}
 
