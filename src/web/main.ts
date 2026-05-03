@@ -449,7 +449,7 @@ function renderNav() {
       <button class="nav-btn" data-v="security"><span class="ic">&#128274;</span>${t.security}</button>
     </div>
     <div style="padding:6px;border-top:1px solid var(--border)"><button class="nav-btn" style="color:var(--red)" onclick="handleLogout()"><span class="ic">&#10140;</span>${t.sign_out}</button></div>`;
-  nav.querySelectorAll('.nav-btn').forEach(b => b.addEventListener('click', () => loadView((b as HTMLElement).dataset.v!)));
+  nav.querySelectorAll('.nav-btn:not([data-nv])').forEach(b => { (b as HTMLElement).dataset.nv='1'; b.addEventListener('click', () => loadView((b as HTMLElement).dataset.v!)); });
   document.getElementById('user-info')!.innerHTML = `<div class="user-avatar">${esc((currentUser?.email||currentUser?.username||'A')[0].toUpperCase())}</div><span>${esc(currentUser?.email||currentUser?.username||'admin')}</span>`;
 }
 
@@ -611,7 +611,7 @@ function startRename(nodeId:string) {
   const nameEl=row.querySelector('.fr-name')!;const oldName=nameEl.textContent!;
   const input=document.createElement('input');input.className='rename-input';input.value=oldName;
   nameEl.replaceWith(input);input.focus();input.select();
-  const finish=async()=>{const newName=input.value.trim()||oldName;if(newName!==oldName){optimisticUpdateRow(nodeId,{name:newName});await sb.from('nodes').update({name:newName,updated_at:new Date().toISOString()}).eq('id',nodeId);await sb.from('audit_log').insert({id:uuidv4(),user_id:currentUser.id,node_id:nodeId,action:'node_rename',details:{old_name:oldName,new_name:newName}});invalidateNodesAndTreeCaches();toast(`${t.rename}: ${newName}`,'ok');loadTree();}loadView(currentView);};
+  const finish=async()=>{const newName=input.value.trim()||oldName;if(newName!==oldName){optimisticUpdateRow(nodeId,{name:newName});try{await sb.from('nodes').update({name:newName,updated_at:new Date().toISOString()}).eq('id',nodeId);await sb.from('audit_log').insert({id:uuidv4(),user_id:currentUser.id,node_id:nodeId,action:'node_rename',details:{old_name:oldName,new_name:newName}});invalidateNodesAndTreeCaches();toast(`${t.rename}: ${newName}`,'ok');loadTree();}catch(e:any){toast(e.message,'err');}}loadView(currentView);};
   input.addEventListener('blur',finish);input.addEventListener('keydown',(e)=>{if(e.key==='Enter')input.blur();if(e.key==='Escape'){input.value=oldName;input.blur();}});
 }
 (window as any).startRename=startRename;
@@ -826,7 +826,10 @@ async function openProductDetail(productId: string) {
 
 // ==================== FILES ====================
 
+let loadFilesSeq = 0;
+
 async function loadFiles(parentId:string|null) {
+  const seq = ++loadFilesSeq;
   const c=document.getElementById('content')!;updateBreadcrumb();
   const cacheKey = `nodes:files:${parentId||'root'}`;
   const nodes = await dedupFetch(cacheKey, async () => {
@@ -835,6 +838,7 @@ async function loadFiles(parentId:string|null) {
     const{data,error}=await q;if(error)throw new Error(error.message);
     return data||[];
   });
+  if (seq !== loadFilesSeq) return;
   const sf=nodes.filter((n: any)=>n.node_type==='folder').length;
   const sfi=nodes.filter((n: any)=>n.node_type==='file').length;
   const ss=nodes.reduce((a:number,n:any)=>a+(n.node_type==='file'?n.size:0),0);
@@ -899,7 +903,7 @@ function bindFileRows() {
 }
 
 // --- Upload ---
-function setupDropZone(){const zone=document.getElementById('drop-zone'),input=document.getElementById('file-input') as HTMLInputElement;if(!zone)return;zone.addEventListener('click',()=>input.click());zone.addEventListener('dragover',e=>{e.preventDefault();zone.classList.add('dragover');});zone.addEventListener('dragleave',()=>zone.classList.remove('dragover'));zone.addEventListener('drop',e=>{e.preventDefault();zone.classList.remove('dragover');handleFiles(e.dataTransfer!.files);});input.onchange=()=>{if(input.files)handleFiles(input.files);input.value='';};}
+function setupDropZone(){const zone=document.getElementById('drop-zone'),input=document.getElementById('file-input') as HTMLInputElement;if(!zone)return;if((zone as any)._dzBound)return;(zone as any)._dzBound=true;zone.addEventListener('click',()=>input.click());zone.addEventListener('dragover',e=>{e.preventDefault();zone.classList.add('dragover');});zone.addEventListener('dragleave',()=>zone.classList.remove('dragover'));zone.addEventListener('drop',e=>{e.preventDefault();zone.classList.remove('dragover');handleFiles(e.dataTransfer!.files);});input.onchange=()=>{if(input.files)handleFiles(input.files);input.value='';};}
 async function handleFiles(fileList:FileList){for(const file of fileList)uploadQueue.push({file,progress:0});if(!isUploading)processUploadQueue();}
 async function processUploadQueue(){if(uploadQueue.length===0){isUploading=false;return;}isUploading=true;renderUploadProgress();while(uploadQueue.length>0){const item=uploadQueue[0];try{await uploadFileWithProgress(item);toast(`${t.upload_complete}: ${item.file.name}`,'ok');}catch(e:any){toast(`${t.upload_failed}: ${item.file.name}`,'err');}uploadQueue.shift();renderUploadProgress();}isUploading=false;invalidateNodesAndTreeCaches();loadFiles(currentParentId);loadTree();}
 function renderUploadProgress(){const el=document.getElementById('upload-progress');if(!el)return;if(uploadQueue.length===0){el.innerHTML='';return;}el.innerHTML=uploadQueue.map(item=>`<div style="background:var(--bg-1);border:1px solid var(--border);border-radius:var(--r);padding:4px 10px;margin-bottom:3px;display:flex;align-items:center;gap:6px"><span style="font-size:11px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(item.file.name)}</span><div class="progress-bar" style="width:60px"><div class="progress-fill" style="width:${item.progress}%"></div></div><span style="font-size:10px;color:var(--accent);width:28px;text-align:right">${item.progress}%</span></div>`).join('');}
@@ -962,7 +966,7 @@ async function openDetail(nodeId:string) {
       <button class="btn-sm primary" style="width:100%;margin-top:8px;justify-content:center" onclick="openShareModal('${nodeId}')">${t.create_link}</button></div>`;
 }
 
-(window as any).addComment=async(versionId:string)=>{const input=document.getElementById('new-comment') as HTMLInputElement;const comment=input.value.trim();if(!comment)return;await sb.from('version_comments').insert({id:uuidv4(),version_id:versionId,user_id:currentUser.id,comment});toast(t.comment,'ok');if(selectedNodeId)openDetail(selectedNodeId);};
+(window as any).addComment=async(versionId:string)=>{const input=document.getElementById('new-comment') as HTMLInputElement;const comment=input.value.trim();if(!comment)return;try{await sb.from('version_comments').insert({id:uuidv4(),version_id:versionId,user_id:currentUser.id,comment});toast(t.comment,'ok');if(selectedNodeId)openDetail(selectedNodeId);}catch(e:any){toast(e.message,'err');}};
 (window as any).deleteFile=async(nodeId:string)=>{if(!confirm(t.delete_confirm))return;optimisticRemoveRow(nodeId);try{await softDeleteNode(nodeId,currentUser.id);invalidateNodesAndTreeCaches();toast(t.delete,'ok');document.getElementById('detail')!.style.display='none';loadTree();if(currentView==='files')loadFiles(currentParentId);}catch(e:any){toast(e.message,'err');loadView(currentView);}};
 (window as any).archiveFile=async(nodeId:string)=>{optimisticRemoveRow(nodeId);try{await sb.from('nodes').update({is_archived:true,updated_at:new Date().toISOString()}).eq('id',nodeId);await sb.from('audit_log').insert({id:uuidv4(),user_id:currentUser.id,node_id:nodeId,action:'archive_files',details:{}});invalidateNodesAndTreeCaches();toast(t.archive_btn,'ok');document.getElementById('detail')!.style.display='none';loadTree();if(currentView==='files')loadFiles(currentParentId);}catch(e:any){toast(e.message,'err');loadView(currentView);}};
 (window as any).unarchiveFileAction=async(nodeId:string)=>{try{await unarchiveFile(nodeId);invalidateNodesAndTreeCaches();toast(t.unarchive_btn,'ok');if(currentView==='archived')loadArchived();else if(currentView==='files')loadFiles(currentParentId);loadTree();}catch(e:any){toast(e.message,'err');}};
@@ -982,7 +986,7 @@ let shareNodeId:string|null=null;
 
 // --- Trash ---
 async function loadTrash(){const c=document.getElementById('content')!;const nodes=await dedupFetch('nodes:trash',async()=>{const{data,error}=await sb.from('nodes').select('*').eq('is_deleted',true).order('deleted_at',{ascending:false});if(error)throw new Error(error.message);return data||[];});updateBreadcrumbView(t.trash);c.innerHTML=nodes.length===0?`<div class="empty"><div class="empty-ic">&#128465;</div><div class="empty-t">${t.no_trash}</div></div>`:`<div class="file-list">${nodes.map((n: any)=>`<div class="file-row" data-id="${n.id}" data-type="${n.node_type}"><div class="fr-icon file">${n.node_type==='folder'?'&#128193;':'&#128196;'}</div><div class="fr-name">${esc(n.name)}</div><div class="fr-size">${fmtSize(n.size)}</div><div class="fr-date">${fmtDate(n.deleted_at)}</div><div class="fr-actions"><button onclick="event.stopPropagation();restoreFromTrash('${n.id}')">${t.restore}</button></div></div>`).join('')}</div>`;}
-(window as any).restoreFromTrash=async(nodeId:string)=>{await sb.from('nodes').update({is_deleted:false,deleted_at:null,updated_at:new Date().toISOString()}).eq('id',nodeId);invalidateNodesAndTreeCaches();toast(t.restore,'ok');loadTrash();loadTree();if(currentView==='files')loadFiles(currentParentId);};
+(window as any).restoreFromTrash=async(nodeId:string)=>{try{await sb.from('nodes').update({is_deleted:false,deleted_at:null,updated_at:new Date().toISOString()}).eq('id',nodeId);invalidateNodesAndTreeCaches();toast(t.restore,'ok');loadTrash();loadTree();if(currentView==='files')loadFiles(currentParentId);}catch(e:any){toast(e.message,'err');}};
 (window as any).purgeTrash=async()=>{try{const count=await purgeDeletedNodes(0);toast(`${t.purge_done}: ${count}`,'ok');loadTrash();}catch(e:any){toast(e.message,'err');}};
 
 // --- Recent ---
@@ -1045,7 +1049,7 @@ c.innerHTML=`
 async function loadExtensions(){const c=document.getElementById('content')!;updateBreadcrumbView(t.extensions);const{data,error}=await sb.from('file_extensions').select('*').order('extension');if(error){c.innerHTML=errMsg(error.message);return;}c.innerHTML=`<div class="section-header"><div class="section-title">${t.extensions} (${(data||[]).length})</div><button class="btn-sm primary" onclick="openAddExtModal()">+ ${t.add_extension}</button></div><table class="tbl"><thead><tr><th>${t.extension}</th><th>${t.mime}</th><th>${t.viewer}</th><th>${t.library}</th><th></th></tr></thead><tbody>${(data||[]).map((e:any)=>`<tr><td style="font-weight:600">.${e.extension}</td><td style="color:var(--text-2);font-size:11px">${e.mime_type}</td><td><span class="badge ${e.is_active?'badge-enc':'badge-arch'}">${e.viewer_type}</span></td><td style="color:var(--text-3);font-size:11px">${e.viewer_library||'-'}</td><td><button class="btn-sm danger" onclick="deleteExt('${e.id}')">${t.delete}</button></td></tr>`).join('')}</tbody></table>`;}
 (window as any).openAddExtModal=()=>{const m=document.getElementById('modal')!;m.innerHTML=`<div class="modal-head"><div class="modal-title">${t.add_extension}</div><button class="modal-x" onclick="closeModal()">&times;</button></div><div class="modal-body"><div class="fg"><label>${t.extension}</label><input id="m-ext" placeholder="pdf" /></div><div class="fg"><label>${t.mime}</label><input id="m-mime" placeholder="application/pdf" /></div><div class="fg"><label>${t.viewer}</label><select id="m-viewer"><option value="text">text</option><option value="image">image</option><option value="iframe">iframe</option><option value="native">native</option><option value="custom">custom</option></select></div><div class="fg"><label>${t.library}</label><input id="m-lib" placeholder="npm:lib (optional)" /></div></div><div class="modal-foot"><button class="btn-sm" onclick="closeModal()">${t.cancel}</button><button class="btn-sm primary" onclick="submitAddExt()">${t.create}</button></div>`;document.getElementById('modal-overlay')!.classList.add('open');};
 (window as any).submitAddExt=async()=>{const ext=(document.getElementById('m-ext') as HTMLInputElement).value.trim().replace(/^\./,'');const mime=(document.getElementById('m-mime') as HTMLInputElement).value.trim();const viewer=(document.getElementById('m-viewer') as HTMLSelectElement).value;const lib=(document.getElementById('m-lib') as HTMLInputElement).value.trim();if(!ext)return;const{error}=await sb.from('file_extensions').insert({extension:ext,mime_type:mime,viewer_type:viewer,viewer_library:lib||null});(window as any).closeModal();if(error)toast('Ошибка: '+error.message,'err');else{toast(t.saved,'ok');loadExtensions();}};
-(window as any).deleteExt=async(id:string)=>{await sb.from('file_extensions').delete().eq('id',id);loadExtensions();};
+(window as any).deleteExt=async(id:string)=>{try{await sb.from('file_extensions').delete().eq('id',id);loadExtensions();}catch(e:any){toast(e.message,'err');}};
 
 // --- Security (2FA, sessions, password change) ---
 async function loadSecurity() {
