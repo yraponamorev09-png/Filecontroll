@@ -624,13 +624,39 @@ async function previewFile(nodeId:string) {
   const {data:extConfig}=await sb.from('file_extensions').select('*').eq('extension',ext).maybeSingle();
   const viewerType=extConfig?.viewer_type||'text';
   const existing=document.getElementById('preview-panel');if(existing)existing.remove();
+
+  // Fetch version and block info for the file
+  const {data:versions}=await sb.from('file_versions').select('*').eq('node_id',nodeId).order('version_number',{ascending:false}).limit(5);
+  const currentVer=(versions||[])[0];
+  let blockInfo='';
+  if(currentVer){
+    const{data:blocks}=await sb.from('file_version_blocks').select('*,data_blocks(size,content_hash,compression)').eq('version_id',currentVer.id).order('block_index');
+    if(blocks&&blocks.length>0){
+      blockInfo=blocks.map((b:any)=>`<div style="display:flex;gap:8px;font-size:10px;padding:2px 0;border-bottom:1px solid var(--bg-2)"><span style="color:var(--text-3);width:20px">#${b.block_index}</span><span style="font-family:monospace;color:var(--accent);flex:1;overflow:hidden;text-overflow:ellipsis">${b.data_blocks?.content_hash?.substring(0,24)||'?'}...</span><span style="color:var(--text-3)">${fmtSize(b.data_blocks?.size||0)}</span><span class="badge ${b.data_blocks?.compression==='none'?'badge-arch':'badge-enc'}">${b.data_blocks?.compression||'?'}</span></div>`).join('');
+    }
+  }
+
   const panel=document.createElement('div');panel.className='preview-panel';panel.id='preview-panel';
+  const isImage=node.mime_type?.startsWith('image/');
+  const isPdf=node.mime_type?.includes('pdf');
+  const isText=node.mime_type?.startsWith('text/')||['md','txt','csv','json','xml','yaml','yml','log','cfg','ini','sh','bat','py','js','ts','css','html','sql'].includes(ext);
+
   let body='';
-  if(viewerType==='image'||node.mime_type?.startsWith('image/'))body=`<img src="https://images.pexels.com/photos/414612/pexels-photo-414612.jpeg?auto=compress&cs=tinysrgb&w=800" alt="${esc(node.name)}" />`;
-  else if(viewerType==='text')body=`<pre>[${esc(node.name)}]\nТип: ${esc(node.mime_type||'?')}\nРазмер: ${fmtSize(node.size)}\nПросмотрщик: ${esc(extConfig?.viewer_library||'текстовый')}</pre>`;
-  else if(viewerType==='iframe')body=`<iframe srcdoc="<html><body style='color:#1a1d26;background:#fff;font-family:sans-serif;padding:20px'><h3>${esc(node.name)}</h3><p>PDF preview</p></body></html>"></iframe>`;
-  else body=`<pre>[${esc(node.name)}]\nФормат .${esc(ext)} требует просмотрщик.\n${extConfig?.viewer_library?`Библиотека: ${esc(extConfig.viewer_library)}`:'Добавьте в Расширениях.'}</pre>`;
-  panel.innerHTML=`<div class="preview-content"><div class="preview-head"><div class="preview-title">${esc(node.name)}</div><button class="btn-sm" onclick="closePreview()">Закрыть</button></div><div class="preview-body">${body}</div></div>`;
+  if(isImage){
+    body=`<div class="preview-file-info"><div class="preview-icon">&#128444;</div><div class="preview-filename">${esc(node.name)}</div><div class="preview-meta">${esc(node.mime_type)} &middot; ${fmtSize(node.size)}</div><div style="margin-top:12px;color:var(--text-3);font-size:11px">Изображение хранится в зашифрованном виде. Скачайте файл для просмотра.</div></div>`;
+  } else if(isPdf){
+    body=`<div class="preview-file-info"><div class="preview-icon">&#128213;</div><div class="preview-filename">${esc(node.name)}</div><div class="preview-meta">${esc(node.mime_type)} &middot; ${fmtSize(node.size)}</div><div style="margin-top:12px;color:var(--text-3);font-size:11px">PDF хранится в зашифрованном виде. Скачайте файл для просмотра.</div></div>`;
+  } else if(isText){
+    body=`<div class="preview-file-info"><div class="preview-icon">&#128196;</div><div class="preview-filename">${esc(node.name)}</div><div class="preview-meta">${esc(node.mime_type)} &middot; ${fmtSize(node.size)}</div><div style="margin-top:12px;color:var(--text-3);font-size:11px">Текстовый файл хранится в зашифрованном виде. Скачайте файл для просмотра.</div></div>`;
+  } else {
+    body=`<div class="preview-file-info"><div class="preview-icon">&#128196;</div><div class="preview-filename">${esc(node.name)}</div><div class="preview-meta">${esc(node.mime_type||'Неизвестный тип')} &middot; ${fmtSize(node.size)}</div><div style="margin-top:12px;color:var(--text-3);font-size:11px">Файл хранится в зашифрованном виде. Скачайте для открытия.</div></div>`;
+  }
+
+  const verHtml=(versions||[]).length>0?`<div style="margin-top:16px"><div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:var(--text-3);margin-bottom:6px">Версии (${(versions||[]).length})</div>${(versions||[]).map((v:any)=>`<div style="display:flex;gap:8px;font-size:11px;padding:3px 0;border-bottom:1px solid var(--bg-2)"><span style="font-weight:600">v${v.version_number}</span>${v.is_current?'<span class="badge badge-enc">текущая</span>':''}<span style="color:var(--text-3);flex:1">${fmtDate(v.created_at)}</span><span style="color:var(--text-3)">${fmtSize(v.total_size)}</span>${v.is_compressed?'<span class="badge badge-comp">сжат</span>':''}</div>`).join('')}</div>`:'';
+
+  const blockHtml=blockInfo?`<div style="margin-top:16px"><div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:var(--text-3);margin-bottom:6px">Блоки данных</div>${blockInfo}</div>`:'';
+
+  panel.innerHTML=`<div class="preview-content"><div class="preview-head"><div class="preview-title">${esc(node.name)}</div><div style="display:flex;gap:4px"><button class="btn-sm primary" onclick="downloadFile('${nodeId}')">&#11015; Скачать</button><button class="btn-sm" onclick="closePreview()">Закрыть</button></div></div><div class="preview-body" style="align-items:flex-start;justify-content:flex-start;overflow-y:auto;padding:20px">${body}${verHtml}${blockHtml}</div></div>`;
   document.body.appendChild(panel);panel.addEventListener('click',(e)=>{if(e.target===panel)closePreview();});
 }
 function closePreview(){const p=document.getElementById('preview-panel');if(p)p.remove();}
@@ -1427,6 +1453,22 @@ function fileIconCls(mime:string|null):string{if(!mime)return'file';if(mime.star
 function errMsg(msg:string):string{return`<div class="empty"><div class="empty-ic">&#9888;</div><div class="empty-t">Ошибка</div><div class="empty-d">${esc(msg)}</div></div>`;}
 function updateBreadcrumbView(name:string){document.getElementById('bc')!.innerHTML=`<a>${t.vault}</a><span class="sep">/</span><a>${name}</a>`;}
 function toast(msg:string,type:'ok'|'err'){const c=document.getElementById('toasts')!;const d=document.createElement('div');d.className=`toast ${type}`;d.innerHTML=`<span>${type==='ok'?'&#10003;':'&#10007;'}</span> ${msg}`;c.appendChild(d);setTimeout(()=>{d.style.opacity='0';d.style.transform='translateX(100%)';d.style.transition='all .2s';setTimeout(()=>d.remove(),200);},3000);}
+
+// --- Theme toggle ---
+function applyTheme(theme: string) {
+  document.documentElement.setAttribute('data-theme', theme);
+  localStorage.setItem('vault-theme', theme);
+  const btn = document.getElementById('theme-toggle');
+  if (btn) btn.innerHTML = theme === 'dark' ? '&#9788;' : '&#9790;';
+}
+(window as any).toggleTheme = () => {
+  const current = document.documentElement.getAttribute('data-theme') || 'light';
+  applyTheme(current === 'dark' ? 'light' : 'dark');
+};
+// Restore saved theme
+const savedTheme = localStorage.getItem('vault-theme');
+if (savedTheme) applyTheme(savedTheme);
+else if (window.matchMedia('(prefers-color-scheme: dark)').matches) applyTheme('dark');
 
 // --- Boot ---
 init();

@@ -20,6 +20,17 @@
       --r:4px;--r-lg:6px;--r-xl:8px;
       --shadow:0 1px 2px rgba(0,0,0,0.06);--shadow-lg:0 4px 16px rgba(0,0,0,0.1);
     }
+    [data-theme="dark"] {
+      --bg-0:#0f1117;--bg-1:#1a1d26;--bg-2:#242833;--bg-3:#2e3340;--bg-hover:#282c38;
+      --border:#2e3340;--border-light:#3a3f4e;
+      --text-0:#e4e6ed;--text-1:#b8bcc8;--text-2:#8b90a0;--text-3:#5f6475;
+      --accent:#4d8eff;--accent-h:#3a7dee;--accent-bg:rgba(77,142,255,0.1);--accent-bg2:rgba(77,142,255,0.15);
+      --green:#22c55e;--green-bg:rgba(34,197,94,0.1);
+      --yellow:#eab308;--yellow-bg:rgba(234,179,8,0.1);
+      --red:#ef4444;--red-bg:rgba(239,68,68,0.1);
+      --cyan:#06b6d4;--cyan-bg:rgba(6,182,212,0.1);
+      --shadow:0 1px 2px rgba(0,0,0,0.2);--shadow-lg:0 4px 16px rgba(0,0,0,0.3);
+    }
     *{margin:0;padding:0;box-sizing:border-box}
     body{font-family:'IBM Plex Sans',-apple-system,system-ui,sans-serif;background:var(--bg-0);color:var(--text-0);line-height:1.5;overflow:hidden;height:100vh;font-size:13px}
     button{font-family:inherit;cursor:pointer}input,select,textarea{font-family:inherit;font-size:13px}
@@ -79,6 +90,7 @@
     .btn-sm.primary:hover{background:var(--accent-h)}
     .btn-sm.danger{color:var(--red);border-color:var(--red-bg)}
     .btn-sm.danger:hover{background:var(--red-bg)}
+    #theme-toggle{font-size:14px;padding:4px 8px;flex-shrink:0}
 
     .content{flex:1;overflow-y:auto;padding:16px 20px}
 
@@ -209,6 +221,10 @@
     .preview-body pre{width:100%;font-size:11px;color:var(--text-1);white-space:pre-wrap;word-break:break-word;font-family:'IBM Plex Mono',monospace}
     .preview-body img{max-width:100%;max-height:100%;object-fit:contain}
     .preview-body iframe{width:100%;height:100%;border:none}
+    .preview-file-info{text-align:center;padding:20px}
+    .preview-icon{font-size:48px;margin-bottom:12px;opacity:0.3}
+    .preview-filename{font-size:16px;font-weight:700;margin-bottom:4px}
+    .preview-meta{font-size:12px;color:var(--text-3)}
 
     /* Tables */
     .tbl{width:100%;border-collapse:collapse;font-size:12px}
@@ -238,7 +254,7 @@
     .file-row.drop-target{outline:2px solid var(--accent);outline-offset:-2px;background:var(--accent-bg);border-radius:var(--r)}
 
     /* Loading overlay */
-    .loading-overlay{position:fixed;inset:0;background:rgba(255,255,255,0.7);z-index:250;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;backdrop-filter:blur(2px)}
+    .loading-overlay{position:fixed;inset:0;background:rgba(128,128,128,0.4);z-index:250;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;backdrop-filter:blur(2px)}
     .loading-spinner{width:28px;height:28px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin 0.6s linear infinite}
     @keyframes spin{to{transform:rotate(360deg)}}
     .loading-msg{font-size:12px;color:var(--text-2);font-weight:500}
@@ -323,6 +339,7 @@
       <div class="breadcrumb" id="bc"></div>
       <div class="search-box"><span class="search-ic">&#128269;</span><input type="text" id="search-input" placeholder="Поиск..." /></div>
       <div class="topbar-actions" id="topbar-actions"></div>
+      <button class="btn-sm" id="theme-toggle" onclick="toggleTheme()" title="Сменить тему">&#9790;</button>
     </div>
     <div class="collab-bar" id="collab-bar" style="display:none"></div>
     <div class="content" id="content"></div>
