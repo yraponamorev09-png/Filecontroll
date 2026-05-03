@@ -62,6 +62,7 @@ export function removeSubscription(sb: SupabaseClient, table: string, filter?: s
 
 // Presence for collaboration
 let presenceChannel: RealtimeChannel | null = null;
+let editingChannel: RealtimeChannel | null = null;
 
 export function joinPresence(
   sb: SupabaseClient,
@@ -106,5 +107,94 @@ export function leavePresence(sb: SupabaseClient) {
   if (presenceChannel) {
     sb.removeChannel(presenceChannel);
     presenceChannel = null;
+  }
+}
+
+export function joinEditingChannel(
+  sb: SupabaseClient,
+  onUpdate: (payload: {
+    user_id: string;
+    node_id: string | null;
+    email?: string;
+    full_name?: string;
+    ts: string;
+  }) => void,
+  onCursor?: (payload: {
+    user_id: string;
+    node_id: string | null;
+    field: string;
+    pos: number;
+    line?: number;
+    col?: number;
+    typing: boolean;
+    email?: string;
+    full_name?: string;
+    ts: string;
+  }) => void,
+) {
+  if (editingChannel) sb.removeChannel(editingChannel);
+  editingChannel = sb
+    .channel('vault-editing')
+    .on('broadcast', { event: 'editing-state' }, (payload: any) => {
+      onUpdate(payload?.payload || payload);
+    })
+    .on('broadcast', { event: 'editing-cursor' }, (payload: any) => {
+      if (onCursor) onCursor(payload?.payload || payload);
+    })
+    .subscribe();
+}
+
+export async function broadcastEditingState(
+  nodeId: string | null,
+  userInfo: { user_id: string; email?: string; full_name?: string },
+) {
+  if (!editingChannel) return;
+  await editingChannel.send({
+    type: 'broadcast',
+    event: 'editing-state',
+    payload: {
+      user_id: userInfo.user_id,
+      email: userInfo.email,
+      full_name: userInfo.full_name,
+      node_id: nodeId,
+      ts: new Date().toISOString(),
+    },
+  });
+}
+
+export async function broadcastEditingCursor(
+  data: {
+    node_id: string | null;
+    field: string;
+    pos: number;
+    line?: number;
+    col?: number;
+    typing: boolean;
+  },
+  userInfo: { user_id: string; email?: string; full_name?: string },
+) {
+  if (!editingChannel) return;
+  await editingChannel.send({
+    type: 'broadcast',
+    event: 'editing-cursor',
+    payload: {
+      user_id: userInfo.user_id,
+      email: userInfo.email,
+      full_name: userInfo.full_name,
+      node_id: data.node_id,
+      field: data.field,
+      pos: data.pos,
+      line: data.line,
+      col: data.col,
+      typing: data.typing,
+      ts: new Date().toISOString(),
+    },
+  });
+}
+
+export function leaveEditingChannel(sb: SupabaseClient) {
+  if (editingChannel) {
+    sb.removeChannel(editingChannel);
+    editingChannel = null;
   }
 }

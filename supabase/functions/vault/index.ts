@@ -692,13 +692,24 @@ async function getFileContentHandler(
   const { data: version } = await versionQuery.maybeSingle();
   if (!version) return errorResponse("Version not found", "VERSION_NOT_FOUND", 404);
 
-  // Generate signed URL from storage
-  const storagePath = `${node.owner_id}/${nodeId}/v${version.version_number}`;
-  const { data: signedUrlData, error: urlError } = await sbAdmin.storage
-    .from("vault-files")
-    .createSignedUrl(storagePath, 3600); // 1 hour
+  // Generate signed URL from storage.
+  // Backward compatibility: support both "<owner>/<node>/1" and "<owner>/<node>/v1".
+  const candidatePaths = [
+    `${node.owner_id}/${nodeId}/${version.version_number}`,
+    `${node.owner_id}/${nodeId}/v${version.version_number}`,
+  ];
+  let signedUrl: string | null = null;
+  for (const storagePath of candidatePaths) {
+    const { data: signedUrlData, error: urlError } = await sbAdmin.storage
+      .from("vault-files")
+      .createSignedUrl(storagePath, 3600); // 1 hour
+    if (!urlError && signedUrlData?.signedUrl) {
+      signedUrl = signedUrlData.signedUrl;
+      break;
+    }
+  }
 
-  if (urlError || !signedUrlData?.signedUrl) {
+  if (!signedUrl) {
     return errorResponse("File content not available in storage", "NO_CONTENT", 404);
   }
 
@@ -707,7 +718,7 @@ async function getFileContentHandler(
     name: node.name,
     mime_type: node.mime_type,
     version_number: version.version_number,
-    url: signedUrlData.signedUrl,
+    url: signedUrl,
   });
 }
 

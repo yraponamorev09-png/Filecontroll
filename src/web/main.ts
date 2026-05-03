@@ -9,7 +9,10 @@ import {
 } from '../core/index.js';
 import type { Permission } from '../types/index.js';
 import { AuthService } from './auth.js';
-import { subscribeToTable, unsubscribeAll, joinPresence, leavePresence } from '../utils/realtime.js';
+import {
+  subscribeToTable, unsubscribeAll, joinPresence, leavePresence,
+  joinEditingChannel, broadcastEditingState, broadcastEditingCursor, leaveEditingChannel,
+} from '../utils/realtime.js';
 import { cacheGet, cacheSet, cacheInvalidate, cacheClear, dedupFetch } from '../utils/cache.js';
 
 // --- Supabase client (uses .env, auth is handled by Supabase Auth) ---
@@ -42,6 +45,11 @@ let treeExpanded: Set<string> = new Set();
 let realtimeSetup = false;
 let loadingOverlay: HTMLElement | null = null;
 let realtimeDebounce: any = null;
+let editingStates: Record<string, { node_id: string | null; email?: string; full_name?: string; ts: string }> = {};
+let activeEditingNodeId: string | null = null;
+let presenceUsers: any[] = [];
+let cursorStates: Record<string, { node_id: string | null; field: string; pos: number; line?: number; col?: number; typing: boolean; email?: string; full_name?: string; ts: string }> = {};
+let cursorFadeTimers: Record<string, any> = {};
 
 // --- i18n ---
 const t: Record<string, string> = {
@@ -146,11 +154,53 @@ function showLoading(msg?: string) {
   if (loadingOverlay) return;
   loadingOverlay = document.createElement('div');
   loadingOverlay.className = 'loading-overlay';
-  loadingOverlay.innerHTML = `<div class="loading-spinner"></div>${msg ? `<div class="loading-msg">${msg}</div>` : ''}`;
+  loadingOverlay.innerHTML = `<div class="loading-spinner"></div><div class="loading-msg">${msg || ''}</div>`;
   document.body.appendChild(loadingOverlay);
+}
+function updateLoading(msg?: string) {
+  if (!loadingOverlay) return;
+  const msgEl = loadingOverlay.querySelector('.loading-msg') as HTMLElement | null;
+  if (msgEl) msgEl.textContent = msg || '';
 }
 function hideLoading() {
   if (loadingOverlay) { loadingOverlay.remove(); loadingOverlay = null; }
+}
+
+// --- Background worker for heavy file ops ---
+let uploadWorker: Worker | null = null;
+let uploadWorkerReqId = 0;
+const uploadWorkerPending = new Map<number, { resolve: (hash: string) => void; reject: (err: Error) => void }>();
+
+function getUploadWorker(): Worker | null {
+  if (typeof Worker === 'undefined') return null;
+  if (uploadWorker) return uploadWorker;
+  uploadWorker = new Worker(new URL('./file-worker.ts', import.meta.url), { type: 'module' });
+  uploadWorker.onmessage = (event: MessageEvent<any>) => {
+    const data = event.data || {};
+    const req = uploadWorkerPending.get(data.id);
+    if (!req) return;
+    uploadWorkerPending.delete(data.id);
+    if (data.ok && data.hash) req.resolve(data.hash);
+    else req.reject(new Error(data.error || 'Worker hash error'));
+  };
+  uploadWorker.onerror = (ev: ErrorEvent) => {
+    uploadWorkerPending.forEach(({ reject }) => reject(new Error(ev.message || 'Upload worker failed')));
+    uploadWorkerPending.clear();
+  };
+  return uploadWorker;
+}
+
+async function hashFileInBackground(buf: ArrayBuffer): Promise<string> {
+  const worker = getUploadWorker();
+  if (!worker) {
+    const hashBuf = await crypto.subtle.digest('SHA-256', buf);
+    return Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+  const id = ++uploadWorkerReqId;
+  return await new Promise<string>((resolve, reject) => {
+    uploadWorkerPending.set(id, { resolve, reject });
+    worker.postMessage({ type: 'hash', id, buffer: buf }, [buf]);
+  });
 }
 
 // --- Optimistic UI helpers ---
@@ -235,6 +285,60 @@ async function init() {
   setupGlobalClicks();
   loadView('products');
   setupRealtimeSubscriptions();
+}
+
+async function setEditingNode(nodeId: string | null) {
+  if (!currentUser) return;
+  if (activeEditingNodeId === nodeId) return;
+  activeEditingNodeId = nodeId;
+  editingStates[currentUser.id] = {
+    node_id: nodeId,
+    email: currentUser.email || '',
+    full_name: currentUser.full_name || '',
+    ts: new Date().toISOString(),
+  };
+  refreshCollabBar();
+  await broadcastEditingState(nodeId, {
+    user_id: currentUser.id,
+    email: currentUser.email || '',
+    full_name: currentUser.full_name || '',
+  });
+}
+
+function refreshCollabBar() {
+  const merged = presenceUsers.map((u: any) => {
+    const uid = u.user_id;
+    if (!uid) return u;
+    const editing = editingStates[uid];
+    if (!editing) return u;
+    return { ...u, node_id: editing.node_id };
+  });
+  renderCollabBar(merged);
+}
+
+function renderLiveCursors(nodeId: string) {
+  const el = document.getElementById('live-cursors');
+  if (!el) return;
+  const active = Object.entries(cursorStates)
+    .filter(([uid, st]) =>
+      uid !== currentUser?.id &&
+      st.node_id === nodeId &&
+      st.field === 'comment' &&
+      st.typing,
+    )
+    .map(([, st]) => st);
+  if (active.length === 0) {
+    el.innerHTML = '';
+    return;
+  }
+  el.innerHTML = active
+    .map((st) => {
+      const p = Math.max(0, st.pos || 0);
+      const line = Math.max(1, (st as any).line || 1);
+      const col = Math.max(1, (st as any).col || 1);
+      return `<span style="display:inline-flex;align-items:center;gap:4px;margin-right:8px"><span class="collab-dot" style="width:6px;height:6px"></span>${esc(st.full_name || st.email || 'Пользователь')} печатает... <span style="opacity:0.75">(строка ${line}, колонка ${col}, позиция ${p})</span></span>`;
+    })
+    .join('');
 }
 
 // --- Auth UI ---
@@ -369,9 +473,17 @@ function showConnectionSetup() {
 };
 
 (window as any).handleLogout = async () => {
+  await setEditingNode(null);
   unsubscribeAll(sb);
   leavePresence(sb);
+  leaveEditingChannel(sb);
   realtimeSetup = false;
+  editingStates = {};
+  presenceUsers = [];
+  activeEditingNodeId = null;
+  Object.values(cursorFadeTimers).forEach((t) => clearTimeout(t));
+  cursorFadeTimers = {};
+  cursorStates = {};
   treeFoldersByParent = {};
   cacheClear();
   await auth.signOut();
@@ -453,7 +565,7 @@ async function seedIfEmpty() {
     await sb.from('audit_log').insert([{id:uuidv4(),user_id:uid,node_id:id,action:'version_create',details:{version_number:1},created_at:'2025-01-15T10:00:00Z'},{id:uuidv4(),user_id:uid,node_id:id,action:'version_create',details:{version_number:2},created_at:'2025-02-20T14:30:00Z'}]);
     // Store demo content in Supabase Storage for preview/download
     const demoContent = generateDemoContent(s.name, s.mime, s.size);
-    const storagePath = `${uid}/${id}/v2`;
+    const storagePath = `${uid}/${id}/2`;
     await sb.storage.from('vault-files').upload(storagePath, demoContent, { contentType: s.mime, upsert: true }).catch(()=>{});
   }
   toast(t.seed_complete,'ok');
@@ -608,7 +720,7 @@ function setupKeyboard() {
     if(e.target instanceof HTMLInputElement||e.target instanceof HTMLSelectElement||e.target instanceof HTMLTextAreaElement)return;
     if(e.key==='Delete'&&selectedNodeId)(window as any).deleteFile(selectedNodeId);
     if(e.key==='F2'&&selectedNodeId)startRename(selectedNodeId);
-    if(e.key==='Escape'){closeCtxMenu();closePreview();document.getElementById('detail')!.style.display='none';selectedNodeId=null;document.querySelectorAll('.file-row.selected').forEach(r=>r.classList.remove('selected'));}
+    if(e.key==='Escape'){closeCtxMenu();closePreview();document.getElementById('detail')!.style.display='none';selectedNodeId=null;setEditingNode(null);document.querySelectorAll('.file-row.selected').forEach(r=>r.classList.remove('selected'));}
     if(e.key==='Backspace'&&currentView==='files'&&pathStack.length>1){(window as any).goBack();e.preventDefault();}
   });
 }
@@ -713,7 +825,8 @@ function setupRealtimeSubscriptions() {
   if (!realtimeSetup && currentUser) {
     realtimeSetup = true;
     joinPresence(sb, currentUser.id, { email: currentUser.email || '', fullName: currentUser.full_name || '' }, (users) => {
-      renderCollabBar(users);
+      presenceUsers = users;
+      refreshCollabBar();
     });
     const debouncedReload = (prefixes: string[], reloader: () => void) => {
       if (prefixes.some(p => p.startsWith('nodes'))) treeFoldersByParent = {};
@@ -742,15 +855,55 @@ function setupRealtimeSubscriptions() {
     subscribeToTable(sb, 'data_blocks', () => {
       debouncedReload(['data_blocks:'], () => { if (currentView === 'blocks') loadBlocks(); });
     });
+    joinEditingChannel(
+      sb,
+      (payload: any) => {
+        if (!payload?.user_id) return;
+        editingStates[payload.user_id] = {
+          node_id: payload.node_id ?? null,
+          email: payload.email,
+          full_name: payload.full_name,
+          ts: payload.ts || new Date().toISOString(),
+        };
+        refreshCollabBar();
+      },
+      (payload: any) => {
+        if (!payload?.user_id) return;
+        cursorStates[payload.user_id] = {
+          node_id: payload.node_id ?? null,
+          field: payload.field || 'comment',
+          pos: payload.pos || 0,
+          typing: !!payload.typing,
+          email: payload.email,
+          full_name: payload.full_name,
+          ts: payload.ts || new Date().toISOString(),
+          ...(payload.line ? { line: payload.line } : {}),
+          ...(payload.col ? { col: payload.col } : {}),
+        };
+        if (cursorFadeTimers[payload.user_id]) clearTimeout(cursorFadeTimers[payload.user_id]);
+        cursorFadeTimers[payload.user_id] = setTimeout(() => {
+          if (cursorStates[payload.user_id]) {
+            cursorStates[payload.user_id].typing = false;
+            if (selectedNodeId) renderLiveCursors(selectedNodeId);
+          }
+        }, 4000);
+        if (selectedNodeId) renderLiveCursors(selectedNodeId);
+      },
+    );
   }
 }
 
 function renderCollabBar(users: any[]) {
   const bar = document.getElementById('collab-bar')!;
   if (currentView !== 'files' && currentView !== 'products') { bar.style.display = 'none'; return; }
-  if (users.length === 0) { bar.style.display = 'none'; return; }
+  const onlineUsers = users.filter((u: any) => !u.node_id || typeof u.node_id === 'string');
+  if (onlineUsers.length === 0) { bar.style.display = 'none'; return; }
+  const activeEditors = onlineUsers.filter((u: any) => !!u.node_id);
   bar.style.display = 'flex';
-  bar.innerHTML = `<div class="collab-dot"></div><span>${t.online}: ${users.length}</span><div style="display:flex;margin-left:4px">${users.map((u: any) => `<div class="collab-user" title="${esc(u.full_name || u.email || '?')}">${esc((u.full_name || u.email || '?')[0].toUpperCase())}</div>`).join('')}</div>`;
+  const editorsLabel = activeEditors.length > 0
+    ? `<span style="margin-left:8px;color:var(--text-2);font-size:11px">Редактируют: ${activeEditors.length}</span>`
+    : '';
+  bar.innerHTML = `<div class="collab-dot"></div><span>${t.online}: ${onlineUsers.length}</span>${editorsLabel}<div style="display:flex;margin-left:4px">${onlineUsers.map((u: any) => `<div class="collab-user" title="${esc(u.full_name || u.email || '?')}${u.node_id ? ' (редактирует файл)' : ''}">${esc((u.full_name || u.email || '?')[0].toUpperCase())}</div>`).join('')}</div>`;
 }
 
 // ==================== PLM: PRODUCTS ====================
@@ -980,7 +1133,7 @@ function bindFileRows() {
       (r as HTMLElement).classList.remove('dragging');
       document.querySelectorAll('.drop-target').forEach(el=>el.classList.remove('drop-target'));
     });
-    r.addEventListener('click',()=>{const id=(r as HTMLElement).dataset.id!,type=(r as HTMLElement).dataset.type!;if(type==='folder'){const name=r.querySelector('.fr-name')!.textContent!;pathStack.push({id,name});currentParentId=id;(document.getElementById('btn-back') as HTMLElement).style.display='flex';loadFiles(id);}else{document.querySelectorAll('.file-row.selected').forEach(x=>x.classList.remove('selected'));r.classList.add('selected');openDetail(id);}});
+    r.addEventListener('click',()=>{const id=(r as HTMLElement).dataset.id!,type=(r as HTMLElement).dataset.type!;if(type==='folder'){setEditingNode(null);const name=r.querySelector('.fr-name')!.textContent!;pathStack.push({id,name});currentParentId=id;(document.getElementById('btn-back') as HTMLElement).style.display='flex';loadFiles(id);}else{document.querySelectorAll('.file-row.selected').forEach(x=>x.classList.remove('selected'));r.classList.add('selected');openDetail(id);}});
     r.addEventListener('dblclick',()=>{const type=(r as HTMLElement).dataset.type!;if(type==='file')previewFile((r as HTMLElement).dataset.id!);});
   });
   // Make folder rows drop targets
@@ -1029,8 +1182,8 @@ function setupDropZone(){const zone=document.getElementById('drop-zone'),input=d
 async function handleFiles(fileList:FileList){for(const file of fileList)uploadQueue.push({file,progress:0});if(!isUploading)processUploadQueue();}
 async function processUploadQueue(){if(uploadQueue.length===0){isUploading=false;return;}isUploading=true;renderUploadProgress();while(uploadQueue.length>0){const item=uploadQueue[0];try{await uploadFileWithProgress(item);toast(`${t.upload_complete}: ${item.file.name}`,'ok');}catch(e:any){toast(`${t.upload_failed}: ${item.file.name}`,'err');}uploadQueue.shift();renderUploadProgress();}isUploading=false;invalidateNodesAndTreeCaches();loadFiles(currentParentId);loadTree();}
 function renderUploadProgress(){const el=document.getElementById('upload-progress');if(!el)return;if(uploadQueue.length===0){el.innerHTML='';return;}el.innerHTML=uploadQueue.map(item=>`<div style="background:var(--bg-1);border:1px solid var(--border);border-radius:var(--r);padding:4px 10px;margin-bottom:3px;display:flex;align-items:center;gap:6px"><span style="font-size:11px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(item.file.name)}</span><div class="progress-bar" style="width:60px"><div class="progress-fill" style="width:${item.progress}%"></div></div><span style="font-size:10px;color:var(--accent);width:28px;text-align:right">${item.progress}%</span></div>`).join('');}
-async function uploadFileWithProgress(item:{file:File;progress:number}){if(!currentUser)throw new Error('No user');const file=item.file;const buf=await file.arrayBuffer();const size=buf.byteLength;const id=uuidv4();item.progress=15;renderUploadProgress();const{error:nodeErr}=await sb.from('nodes').insert({id,parent_id:currentParentId,owner_id:currentUser.id,name:file.name,node_type:'file',path:`/${file.name}`,mime_type:file.type||'application/octet-stream',size});if(nodeErr)throw nodeErr;item.progress=30;renderUploadProgress();const hashBuf=await crypto.subtle.digest('SHA-256',buf);const hash=Array.from(new Uint8Array(hashBuf)).map(b=>b.toString(16).padStart(2,'0')).join('');item.progress=45;renderUploadProgress();const vid=uuidv4();await sb.from('file_versions').insert({id:vid,node_id:id,version_number:1,total_size:size,content_hash:hash,encrypted_key:new Uint8Array(32),key_nonce:new Uint8Array(24),is_current:true,is_compressed:false,created_by:currentUser.id,comment:'Загружен'});item.progress=55;renderUploadProgress();const bid=uuidv4();await sb.from('data_blocks').insert({id:bid,content_hash:hash,encrypted_hash:hash,size,encrypted_size:size+16,physical_path:`/vault/blocks/${hash.substring(0,2)}/${hash}`,compression:'none',ref_count:1});await sb.from('file_version_blocks').insert({id:uuidv4(),version_id:vid,block_id:bid,block_index:0,block_offset:0});item.progress=65;renderUploadProgress();// Store actual file content in Supabase Storage for preview/download
-const storagePath=`${currentUser.id}/${id}/v1`;const{error:storageErr}=await sb.storage.from('vault-files').upload(storagePath,file,{contentType:file.type||'application/octet-stream',upsert:true});if(storageErr)console.warn('Storage upload failed (non-fatal):',storageErr.message);item.progress=85;renderUploadProgress();await sb.from('audit_log').insert({id:uuidv4(),user_id:currentUser.id,node_id:id,action:'version_create',details:{version_number:1,size}});item.progress=100;renderUploadProgress();}
+async function uploadFileWithProgress(item:{file:File;progress:number}){if(!currentUser)throw new Error('No user');const file=item.file;const buf=await file.arrayBuffer();const size=buf.byteLength;const id=uuidv4();item.progress=15;renderUploadProgress();const{error:nodeErr}=await sb.from('nodes').insert({id,parent_id:currentParentId,owner_id:currentUser.id,name:file.name,node_type:'file',path:`/${file.name}`,mime_type:file.type||'application/octet-stream',size});if(nodeErr)throw nodeErr;item.progress=30;renderUploadProgress();const hash=await hashFileInBackground(buf);item.progress=45;renderUploadProgress();const vid=uuidv4();await sb.from('file_versions').insert({id:vid,node_id:id,version_number:1,total_size:size,content_hash:hash,encrypted_key:new Uint8Array(32),key_nonce:new Uint8Array(24),is_current:true,is_compressed:false,created_by:currentUser.id,comment:'Загружен'});item.progress=55;renderUploadProgress();const bid=uuidv4();await sb.from('data_blocks').insert({id:bid,content_hash:hash,encrypted_hash:hash,size,encrypted_size:size+16,physical_path:`/vault/blocks/${hash.substring(0,2)}/${hash}`,compression:'none',ref_count:1});await sb.from('file_version_blocks').insert({id:uuidv4(),version_id:vid,block_id:bid,block_index:0,block_offset:0});item.progress=65;renderUploadProgress();// Store actual file content in Supabase Storage for preview/download
+const storagePath=`${currentUser.id}/${id}/1`;const{error:storageErr}=await sb.storage.from('vault-files').upload(storagePath,file,{contentType:file.type||'application/octet-stream',upsert:true});if(storageErr)console.warn('Storage upload failed (non-fatal):',storageErr.message);item.progress=85;renderUploadProgress();await sb.from('audit_log').insert({id:uuidv4(),user_id:currentUser.id,node_id:id,action:'version_create',details:{version_number:1,size}});item.progress=100;renderUploadProgress();}
 (window as any).triggerUpload=()=>{(document.getElementById('file-input') as HTMLInputElement).click();};
 (window as any).createFolder=async()=>{
   if(!currentUser)return;
@@ -1063,6 +1216,7 @@ function updateBreadcrumb(){document.getElementById('bc')!.innerHTML=pathStack.m
 
 // --- Detail ---
 async function openDetail(nodeId:string) {
+  await setEditingNode(nodeId);
   selectedNodeId=nodeId;const panel=document.getElementById('detail')!;panel.style.display='flex';
   const{data:node}=await sb.from('nodes').select('*').eq('id',nodeId).maybeSingle();if(!node)return;
   panel.innerHTML=`<div class="detail-head"><div class="detail-name">${esc(node.name)}</div><div class="detail-sub">${esc(node.mime_type||'Файл')} &middot; ${fmtSize(node.size)}</div></div><div style="padding:14px;color:var(--text-3)">Загрузка...</div>`;
@@ -1086,13 +1240,40 @@ async function openDetail(nodeId:string) {
     </div>
     ${currentVer?`<div class="detail-sec"><div class="detail-sec-title">${t.comment} <span class="detail-sec-count">${comments.length}</span></div>
       ${comments.map((c:any)=>`<div class="comment-item"><span class="comment-author">${esc(c.user_profiles?.full_name||c.user_profiles?.email||'?')}</span><div class="comment-text">${esc(c.comment)}</div><div class="comment-date">${fmtDate(c.created_at)}</div></div>`).join('')}
-      <div class="comment-form"><input id="new-comment" placeholder="${t.add_comment}..." /><button onclick="addComment('${currentVer.id}')">${t.create}</button></div></div>`:''}
+      <div class="comment-form"><textarea id="new-comment" placeholder="${t.add_comment}..." style="min-height:64px;resize:vertical"></textarea><button onclick="addComment('${currentVer.id}')">${t.create}</button></div><div id="live-cursors" style="margin-top:6px;font-size:11px;color:var(--text-2)"></div></div>`:''}
     <div class="detail-sec"><div class="detail-sec-title">${t.access} <span class="detail-sec-count">${acls.length}</span></div>
       ${acls.length===0?`<div style="font-size:11px;color:var(--text-3)">${t.owner_only}</div>`:acls.map((a:any)=>`<div class="acl-row"><div class="acl-av">${esc((a.user_profiles?.full_name||a.user_profiles?.email||'?')[0].toUpperCase())}</div><div class="acl-name">${esc(a.user_profiles?.full_name||a.user_profiles?.email||'?')}</div><span class="acl-perm ${a.permission}">${a.permission}</span>${isOwner?`<button class="btn-restore" onclick="revokeAccess('${nodeId}','${a.user_id}')" style="color:var(--red)">&times;</button>`:''}</div>`).join('')}
       ${isOwner?`<button class="btn-sm" style="width:100%;margin-top:6px;justify-content:center" onclick="openGrantModal('${nodeId}')">+ ${t.grant_access}</button>`:''}</div>
     <div class="detail-sec"><div class="detail-sec-title">${t.share_links} <span class="detail-sec-count">${shares.length}</span></div>
       ${shares.map((s:any)=>`<div class="share-row"><div class="share-tok">${s.token.substring(0,20)}...</div><div class="share-meta">${s.permission==='read'?t.read_only:t.read_write} &middot; ${s.access_count} ${t.accesses}${s.expires_at?` &middot; ${fmtDate(s.expires_at)}`:''}</div><button class="btn-restore" onclick="revokeShare('${s.id}','${nodeId}')" style="color:var(--red);margin-top:2px">${t.revoke}</button></div>`).join('')}
       <button class="btn-sm primary" style="width:100%;margin-top:8px;justify-content:center" onclick="openShareModal('${nodeId}')">${t.create_link}</button></div>`;
+  const commentInput = document.getElementById('new-comment') as HTMLTextAreaElement | null;
+  if (commentInput && currentUser) {
+    let typingTimer: any = null;
+    const calcLineCol = () => {
+      const pos = commentInput.selectionStart || 0;
+      const value = commentInput.value || '';
+      const before = value.slice(0, pos);
+      const parts = before.split('\n');
+      return { pos, line: parts.length, col: (parts[parts.length - 1] || '').length + 1 };
+    };
+    const sendCursor = (typing: boolean) => {
+      const lc = calcLineCol();
+      broadcastEditingCursor(
+        { node_id: nodeId, field: 'comment', pos: lc.pos, typing, line: lc.line, col: lc.col },
+        { user_id: currentUser.id, email: currentUser.email || '', full_name: currentUser.full_name || '' },
+      );
+    };
+    commentInput.addEventListener('input', () => {
+      sendCursor(true);
+      clearTimeout(typingTimer);
+      typingTimer = setTimeout(() => sendCursor(false), 1200);
+    });
+    commentInput.addEventListener('click', () => sendCursor(true));
+    commentInput.addEventListener('keyup', () => sendCursor(true));
+    commentInput.addEventListener('blur', () => sendCursor(false));
+    renderLiveCursors(nodeId);
+  }
 }
 
 (window as any).addComment=async(versionId:string)=>{const input=document.getElementById('new-comment') as HTMLInputElement;const comment=input.value.trim();if(!comment)return;try{await sb.from('version_comments').insert({id:uuidv4(),version_id:versionId,user_id:currentUser.id,comment});toast(t.comment,'ok');if(selectedNodeId)openDetail(selectedNodeId);}catch(e:any){toast(e.message,'err');}};
@@ -1440,8 +1621,9 @@ async function loadBackups() {
 (window as any).submitCreateBackup = async () => {
   const type = (document.getElementById('m-backup-type') as HTMLSelectElement).value;
   (window as any).closeModal();
-  showLoading(t.create_backup);
+  showLoading(`${t.create_backup}...`);
   try {
+    updateLoading(`Создание бэкапа (${type})...`);
     const res = await fetch(`${VAULT_API}/backups`, {
       method: 'POST',
       headers: await vaultHeaders(),
@@ -1456,8 +1638,9 @@ async function loadBackups() {
 };
 
 (window as any).verifyBackup = async (id: string) => {
-  showLoading(t.verify);
+  showLoading(`${t.verify}...`);
   try {
+    updateLoading('Проверка контрольных сумм...');
     const res = await fetch(`${VAULT_API}/backups/verify`, {
       method: 'POST',
       headers: await vaultHeaders(),
@@ -1473,8 +1656,9 @@ async function loadBackups() {
 
 (window as any).restoreBackup = async (id: string) => {
   if (!confirm(t.restore_confirm)) return;
-  showLoading(t.restore);
+  showLoading(`${t.restore}...`);
   try {
+    updateLoading('Восстановление данных из бэкапа...');
     const res = await fetch(`${VAULT_API}/backups/restore`, {
       method: 'POST',
       headers: await vaultHeaders(),
@@ -1490,13 +1674,15 @@ async function loadBackups() {
 };
 
 (window as any).runIntegrityCheckAll = async () => {
-  showLoading(t.integrity_check);
+  showLoading(`${t.integrity_check}...`);
   try {
     const { data: nodes } = await sb.from('nodes').select('id').eq('is_deleted', false).eq('node_type', 'file').limit(50);
     if (!nodes || nodes.length === 0) { toast('Нет файлов для проверки', 'err'); return; }
     let checked = 0;
     let issues = 0;
+    const total = nodes.length;
     for (const node of nodes) {
+      updateLoading(`${t.integrity_check}: ${checked + 1}/${total}`);
       const res = await fetch(`${VAULT_API}/integrity-check`, {
         method: 'POST',
         headers: await vaultHeaders(),
