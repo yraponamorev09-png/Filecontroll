@@ -1,3 +1,4 @@
+import { v4 as uuidv4 } from 'uuid';
 import { getSupabaseClient } from '../utils/db.js';
 import type { Action, Permission, PermissionCheckResult, AccessControlEntry, Node } from '../types/index.js';
 import { NodeNotFoundError, PermissionDeniedError, VaultError } from '../types/index.js';
@@ -262,7 +263,6 @@ async function logAclChange(
   targetUserId: string,
   permission: Permission | null,
 ): Promise<void> {
-  const { v4: uuidv4 } = await import('uuid');
   await sb.from('audit_log').insert({
     id: uuidv4(),
     user_id: userId,

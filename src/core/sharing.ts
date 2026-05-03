@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from 'uuid';
 import { getSupabaseClient } from '../utils/db.js';
-import { generateToken, hashPassword } from '../utils/crypto.js';
+import { generateToken, hashPassword, verifyPassword } from '../utils/crypto.js';
 import type { ShareLink, ShareLinkResult } from '../types/index.js';
 import { VaultError, ShareLinkExpiredError, PermissionDeniedError } from '../types/index.js';
 import { assertPermission } from './access.js';
@@ -129,7 +129,6 @@ export async function validateShareLink(
     if (!password) return { valid: false, nodeId: link.node_id, permission: link.permission, reason: 'PASSWORD_REQUIRED' };
 
     const [salt, storedHash] = link.password_hash.split('$');
-    const { verifyPassword } = await import('../utils/crypto.js');
     if (!await verifyPassword(password, storedHash, salt)) {
       return { valid: false, nodeId: link.node_id, permission: link.permission, reason: 'INVALID_PASSWORD' };
     }

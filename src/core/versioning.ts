@@ -278,25 +278,14 @@ export async function listFileVersions(
 export async function garbageCollectBlocks(vaultDir: string): Promise<number> {
   const sb = getSupabaseClient();
 
-  const { data: orphans, error } = await sb
-    .from('data_blocks')
-    .select('id, physical_path')
-    .lte('ref_count', 0);
+  const { data, error } = await sb.rpc('gc_orphaned_blocks');
 
-  if (error) throw new VaultError(`GC query failed: ${error.message}`, 'DB_ERROR');
-  if (!orphans || orphans.length === 0) return 0;
+  if (error) throw new VaultError(`GC failed: ${error.message}`, 'DB_ERROR');
 
   // In production: delete physical files from disk
   // for (const block of orphans) {
   //   await fs.unlink(block.physical_path);
   // }
 
-  const { error: deleteErr } = await sb
-    .from('data_blocks')
-    .delete()
-    .lte('ref_count', 0);
-
-  if (deleteErr) throw new VaultError(`GC delete failed: ${deleteErr.message}`, 'DB_ERROR');
-
-  return orphans.length;
+  return (data as number) ?? 0;
 }

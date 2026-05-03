@@ -596,11 +596,12 @@ function showContextMenu(row:HTMLElement,x:number,y:number) {
      <div class="ctx-item" data-action="rename" data-id="${id}"><span class="ctx-ic">&#9998;</span>${t.rename}</div>
      <div class="ctx-sep"></div>
      <div class="ctx-item" data-action="archive" data-id="${id}"><span class="ctx-ic">&#128230;</span>${t.archive_btn}</div>`;
+  items+=`<div class="ctx-item" data-action="move" data-id="${id}"><span class="ctx-ic">&#128193;</span>Переместить</div>`;
   items+=`<div class="ctx-sep"></div><div class="ctx-item danger" data-action="delete" data-id="${id}"><span class="ctx-ic">&#128465;</span>${t.delete}</div>`;
   menu.innerHTML=items;document.body.appendChild(menu);ctxMenuEl=menu;
   menu.querySelectorAll('.ctx-item').forEach(item=>{item.addEventListener('click',()=>{
     const action=(item as HTMLElement).dataset.action!,id=(item as HTMLElement).dataset.id!;closeCtxMenu();
-    switch(action){case 'open':pathStack.push({id,name});currentParentId=id;loadFiles(id);break;case 'info':openDetail(id);break;case 'preview':previewFile(id);break;case 'download':(window as any).downloadFile(id);break;case 'rename':startRename(id);break;case 'archive':(window as any).archiveFile(id);break;case 'delete':(window as any).deleteFile(id);break;}
+    switch(action){case 'open':pathStack.push({id,name});currentParentId=id;loadFiles(id);break;case 'info':openDetail(id);break;case 'preview':previewFile(id);break;case 'download':(window as any).downloadFile(id);break;case 'rename':startRename(id);break;case 'archive':(window as any).archiveFile(id);break;case 'move':openMoveModal(id);break;case 'delete':(window as any).deleteFile(id);break;}
   });});
 }
 function closeCtxMenu(){if(ctxMenuEl){ctxMenuEl.remove();ctxMenuEl=null;}}
@@ -897,9 +898,58 @@ function setupVirtualScroll(nodes: any[]) {
 function bindFileRows() {
   document.querySelectorAll('.file-row:not([data-bound])').forEach(r=>{
     (r as HTMLElement).dataset.bound='1';
+    // Make rows draggable for move operations
+    (r as HTMLElement).draggable = true;
+    r.addEventListener('dragstart',(e: DragEvent)=>{
+      e.dataTransfer!.setData('text/plain', (r as HTMLElement).dataset.id!);
+      (r as HTMLElement).classList.add('dragging');
+    });
+    r.addEventListener('dragend',()=>{
+      (r as HTMLElement).classList.remove('dragging');
+      document.querySelectorAll('.drop-target').forEach(el=>el.classList.remove('drop-target'));
+    });
     r.addEventListener('click',()=>{const id=(r as HTMLElement).dataset.id!,type=(r as HTMLElement).dataset.type!;if(type==='folder'){const name=r.querySelector('.fr-name')!.textContent!;pathStack.push({id,name});currentParentId=id;(document.getElementById('btn-back') as HTMLElement).style.display='flex';loadFiles(id);}else{document.querySelectorAll('.file-row.selected').forEach(x=>x.classList.remove('selected'));r.classList.add('selected');openDetail(id);}});
     r.addEventListener('dblclick',()=>{const type=(r as HTMLElement).dataset.type!;if(type==='file')previewFile((r as HTMLElement).dataset.id!);});
   });
+  // Make folder rows drop targets
+  document.querySelectorAll('.file-row[data-type="folder"]').forEach(f=>{
+    f.addEventListener('dragover',(e: DragEvent)=>{
+      e.preventDefault();
+      e.dataTransfer!.dropEffect = 'move';
+      f.classList.add('drop-target');
+    });
+    f.addEventListener('dragleave',()=>f.classList.remove('drop-target'));
+    f.addEventListener('drop',async(e: DragEvent)=>{
+      e.preventDefault();
+      f.classList.remove('drop-target');
+      const nodeId = e.dataTransfer!.getData('text/plain');
+      const targetId = (f as HTMLElement).dataset.id!;
+      if(nodeId === targetId) return;
+      await moveNodeToFolder(nodeId, targetId);
+    });
+  });
+}
+
+async function moveNodeToFolder(nodeId: string, targetFolderId: string) {
+  if(!currentUser) return;
+  // Prevent moving a folder into itself or its descendant
+  const { data: targetNode } = await sb.from('nodes').select('id, path').eq('id', targetFolderId).maybeSingle();
+  if(!targetNode) return;
+  const { data: movingNode } = await sb.from('nodes').select('id, name, path, node_type').eq('id', nodeId).maybeSingle();
+  if(!movingNode) return;
+  // Check for self-move
+  if(nodeId === targetFolderId) { toast('Нельзя переместить в себя', 'err'); return; }
+  try {
+    const newPath = targetNode.path + '/' + movingNode.name;
+    await sb.from('nodes').update({ parent_id: targetFolderId, path: newPath, updated_at: new Date().toISOString() }).eq('id', nodeId);
+    await sb.from('audit_log').insert({ id: uuidv4(), user_id: currentUser.id, node_id: nodeId, action: 'node_move', details: { target_folder: targetFolderId, new_path: newPath } });
+    invalidateNodesAndTreeCaches();
+    toast(`Перемещено в ${targetNode.path}`, 'ok');
+    loadTree();
+    loadFiles(currentParentId);
+  } catch(e: any) {
+    toast(e.message, 'err');
+  }
 }
 
 // --- Upload ---
@@ -913,15 +963,21 @@ async function uploadFileWithProgress(item:{file:File;progress:number}){if(!curr
   if(!currentUser)return;
   const name='Новая папка';
   const id=uuidv4();
-  const tempNode={id,parent_id:currentParentId,owner_id:currentUser.id,name,node_type:'folder',path:`/${name}`,size:0,mime_type:null,is_archived:false,is_deleted:false,updated_at:new Date().toISOString(),created_at:new Date().toISOString()};
-  optimisticInsertRow(document.getElementById('content')!,fileRow(tempNode));
   try{
     const{error}=await sb.from('nodes').insert({id,parent_id:currentParentId,owner_id:currentUser.id,name,node_type:'folder',path:`/${name}`,size:0});
-    if(error){toast(error.message,'err');loadFiles(currentParentId);return;}
+    if(error){toast(error.message,'err');return;}
     invalidateNodesAndTreeCaches();
     toast(t.folder_created,'ok');
     loadTree();
-    loadFiles(currentParentId);
+    await loadFiles(currentParentId);
+    // Inline rename: find the new row and start editing
+    requestAnimationFrame(()=>{
+      const row=document.querySelector(`.file-row[data-id="${id}"]`);
+      if(row){
+        row.classList.add('selected');
+        startRename(id);
+      }
+    });
   }catch(e:any){
     toast(e.message,'err');
     loadFiles(currentParentId);
@@ -983,6 +1039,45 @@ let shareNodeId:string|null=null;
 (window as any).closeModal=()=>{document.getElementById('modal-overlay')!.classList.remove('open');};
 (window as any).submitShare=async()=>{if(!shareNodeId||!currentUser)return;const pw=(document.getElementById('m-pw') as HTMLInputElement).value;const ttl=parseInt((document.getElementById('m-ttl') as HTMLInputElement).value)||24;const perm=(document.getElementById('m-perm') as HTMLSelectElement).value as 'read'|'write';const max=(document.getElementById('m-max') as HTMLInputElement).value;try{const result=await createShareLink(currentUser.id,shareNodeId,{password:pw||undefined,expiresInHours:ttl,maxAccessCount:max?parseInt(max):undefined,permission:perm});(window as any).closeModal();toast(`${t.link_created}: ${result.token.substring(0,12)}...`,'ok');openDetail(shareNodeId);}catch(e:any){(window as any).closeModal();toast(e.message,'err');}};
 (window as any).revokeShare=async(linkId:string,nodeId:string)=>{try{await revokeShareLink(currentUser.id,linkId);toast(t.revoke,'ok');openDetail(nodeId);}catch(e:any){toast(e.message,'err');}};
+
+// --- Move modal ---
+async function openMoveModal(nodeId: string) {
+  const { data: node } = await sb.from('nodes').select('id, name, parent_id').eq('id', nodeId).maybeSingle();
+  if (!node) return;
+  const { data: folders } = await sb.from('nodes').select('id, name, parent_id, path').eq('node_type', 'folder').eq('is_deleted', false).eq('is_archived', false).neq('id', nodeId).order('name');
+  const m = document.getElementById('modal')!;
+  m.innerHTML = `<div class="modal-head"><div class="modal-title">Переместить: ${esc(node.name)}</div><button class="modal-x" onclick="closeModal()">&times;</button></div>
+    <div class="modal-body">
+      <div class="fg"><label>Целевая папка</label>
+        <select id="m-move-target">
+          <option value="">Корень хранилища</option>
+          ${(folders || []).map((f: any) => `<option value="${f.id}" ${f.id === node.parent_id ? 'disabled' : ''}>${esc(f.path || f.name)}</option>`).join('')}
+        </select>
+      </div>
+    </div>
+    <div class="modal-foot"><button class="btn-sm" onclick="closeModal()">${t.cancel}</button><button class="btn-sm primary" onclick="submitMove('${nodeId}')">Переместить</button></div>`;
+  document.getElementById('modal-overlay')!.classList.add('open');
+}
+(window as any).submitMove = async (nodeId: string) => {
+  const targetId = (document.getElementById('m-move-target') as HTMLSelectElement).value || null;
+  if (targetId) {
+    await moveNodeToFolder(nodeId, targetId);
+  } else {
+    // Move to root
+    if (!currentUser) return;
+    const { data: node } = await sb.from('nodes').select('name').eq('id', nodeId).maybeSingle();
+    if (!node) return;
+    try {
+      await sb.from('nodes').update({ parent_id: null, path: `/${node.name}`, updated_at: new Date().toISOString() }).eq('id', nodeId);
+      await sb.from('audit_log').insert({ id: uuidv4(), user_id: currentUser.id, node_id: nodeId, action: 'node_move', details: { target_folder: null } });
+      invalidateNodesAndTreeCaches();
+      toast('Перемещено в корень', 'ok');
+      loadTree();
+      loadFiles(currentParentId);
+    } catch (e: any) { toast(e.message, 'err'); }
+  }
+  (window as any).closeModal();
+};
 
 // --- Trash ---
 async function loadTrash(){const c=document.getElementById('content')!;const nodes=await dedupFetch('nodes:trash',async()=>{const{data,error}=await sb.from('nodes').select('*').eq('is_deleted',true).order('deleted_at',{ascending:false});if(error)throw new Error(error.message);return data||[];});updateBreadcrumbView(t.trash);c.innerHTML=nodes.length===0?`<div class="empty"><div class="empty-ic">&#128465;</div><div class="empty-t">${t.no_trash}</div></div>`:`<div class="file-list">${nodes.map((n: any)=>`<div class="file-row" data-id="${n.id}" data-type="${n.node_type}"><div class="fr-icon file">${n.node_type==='folder'?'&#128193;':'&#128196;'}</div><div class="fr-name">${esc(n.name)}</div><div class="fr-size">${fmtSize(n.size)}</div><div class="fr-date">${fmtDate(n.deleted_at)}</div><div class="fr-actions"><button onclick="event.stopPropagation();restoreFromTrash('${n.id}')">${t.restore}</button></div></div>`).join('')}</div>`;}
@@ -1326,7 +1421,7 @@ async function loadBackups() {
 // --- Helpers ---
 function fmtSize(b:number):string{if(b===0)return'0 Б';const k=1024;const u=['Б','КБ','МБ','ГБ','ТБ'];const i=Math.floor(Math.log(b)/Math.log(k));return parseFloat((b/Math.pow(k,i)).toFixed(1))+' '+u[i];}
 function fmtDate(d:string):string{if(!d)return'--';return new Date(d).toLocaleDateString('ru-RU',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'});}
-function fmtAction(a:string):string{const map:Record<string,string>={version_create:'Создание версии',version_restore:'Восстановление',acl_grant:'Выдача прав',acl_revoke:'Отзыв прав',share_link_create:'Создание ссылки',share_link_revoke:'Отзыв ссылки',node_soft_delete:'Удаление',node_rename:'Переименование',archive_versions:'Архивация',archive_files:'Архивация файлов',file_lock:'Блокировка',file_unlock:'Разблокировка',conflict_resolve:'Разрешение конфликта',lifecycle_change:'Смена этапа ЖЦ',workflow_start:'Запуск маршрута',deploy_start:'Развертывание'};return map[a]||a.replace(/_/g,' ');}
+function fmtAction(a:string):string{const map:Record<string,string>={version_create:'Создание версии',version_restore:'Восстановление',acl_grant:'Выдача прав',acl_revoke:'Отзыв прав',share_link_create:'Создание ссылки',share_link_revoke:'Отзыв ссылки',node_soft_delete:'Удаление',node_rename:'Переименование',node_move:'Перемещение',archive_versions:'Архивация',archive_files:'Архивация файлов',file_lock:'Блокировка',file_unlock:'Разблокировка',conflict_resolve:'Разрешение конфликта',lifecycle_change:'Смена этапа ЖЦ',workflow_start:'Запуск маршрута',deploy_start:'Развертывание'};return map[a]||a.replace(/_/g,' ');}
 function fileIcon(mime:string|null):string{if(!mime)return'&#128196;';if(mime.startsWith('image/'))return'&#128444;';if(mime.includes('pdf'))return'&#128213;';if(mime.includes('word')||mime.includes('doc'))return'&#128209;';if(mime.includes('sheet')||mime.includes('xls')||mime.includes('csv'))return'&#128202;';return'&#128196;';}
 function fileIconCls(mime:string|null):string{if(!mime)return'file';if(mime.startsWith('image/'))return'img';if(mime.includes('pdf')||mime.includes('word')||mime.includes('doc'))return'doc';return'file';}
 function errMsg(msg:string):string{return`<div class="empty"><div class="empty-ic">&#9888;</div><div class="empty-t">Ошибка</div><div class="empty-d">${esc(msg)}</div></div>`;}
