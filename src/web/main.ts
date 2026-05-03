@@ -392,6 +392,35 @@ function showConnectionSetup() {
   } catch (e: any) { toast(t.connection_failed + ': ' + e.message,'err'); }
 };
 
+function generateDemoContent(name: string, mime: string, size: number): Blob {
+  if (mime.startsWith('image/')) {
+    // Generate a simple SVG placeholder as PNG won't work without canvas
+    if (mime.includes('svg')) {
+      const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300" viewBox="0 0 400 300"><rect fill="#e8e9ed" width="400" height="300"/><text x="200" y="140" text-anchor="middle" font-family="sans-serif" font-size="16" fill="#6b7085">${esc(name)}</text><text x="200" y="165" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#9da1b0">Vault PLM Demo</text></svg>`;
+      return new Blob([svg], { type: mime });
+    }
+    // For PNG/JPG: create a minimal valid 1x1 pixel image and pad
+    const pngHeader = new Uint8Array([137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,1,0,0,0,1,8,2,0,0,0,144,119,83,222,0,0,0,12,73,68,65,84,8,215,99,8,6,0,0,0,2,0,1,226,33,188,51,0,0,0,0,73,69,78,68,174,66,96,130]);
+    return new Blob([pngHeader], { type: mime });
+  }
+  if (mime.includes('pdf')) {
+    // Minimal valid PDF
+    const pdf = `%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R/Resources<</Font<</F1 4 0 R>>>>/Contents 5 0 R>>endobj\n4 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\n5 0 obj<</Length 44>>stream\nBT /F1 12 Tf 100 700 Td (${esc(name)}) Tj ET\nendstream\nendobj\nxref\n0 6\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \n0000000266 00000 n \n0000000340 00000 n \ntrailer<</Size 6/Root 1 0 R>>\nstartxref\n434\n%%EOF`;
+    return new Blob([pdf], { type: 'application/pdf' });
+  }
+  if (mime.includes('csv')) {
+    const csv = '\uFEFFНазвание,Количество,Цена\nДокумент А,10,1500\nДокумент Б,5,2300\nОтчёт В,3,890\nИтого,18,4690\n';
+    return new Blob([csv], { type: 'text/csv' });
+  }
+  if (mime.includes('markdown') || name.endsWith('.md')) {
+    const md = `# ${esc(name.replace('.md',''))}\n\nДокументация Vault PLM.\n\n## Описание\n\nЭто демонстрационный файл для системы управления документами.\n\n## Структура\n\n- Папка 1: Документы\n- Папка 2: Изображения\n- Папка 3: Проекты\n\n## Версии\n\n| Версия | Дата | Автор |\n|--------|------|-------|\n| v1 | 2025-01-15 | admin |\n| v2 | 2025-02-20 | admin |\n`;
+    return new Blob([md], { type: 'text/markdown' });
+  }
+  // Generic text content for other types
+  const text = `Vault PLM - ${esc(name)}\n\nТип: ${esc(mime)}\nРазмер: ${fmtSize(size)}\nДата: ${new Date().toLocaleDateString('ru-RU')}\n\nЭто демонстрационный файл системы Vault PLM.\nФайл хранится в зашифрованном виде с версионностью и контролем доступа.`;
+  return new Blob([text], { type: mime || 'application/octet-stream' });
+}
+
 async function seedIfEmpty() {
   const { count } = await sb.from('nodes').select('*',{count:'exact',head:true}).eq('is_deleted',false);
   if (count && count > 0) return;
@@ -422,6 +451,10 @@ async function seedIfEmpty() {
     await sb.from('data_blocks').insert({id:b1,content_hash:h1,encrypted_hash:h1,size:Math.floor(s.size*0.8),encrypted_size:Math.floor(s.size*0.8)+16,physical_path:`/vault/blocks/${h1.substring(0,2)}/${h1}`,compression:'none',ref_count:1});
     await sb.from('file_version_blocks').insert([{id:uuidv4(),version_id:v1,block_id:b1,block_index:0,block_offset:0},{id:uuidv4(),version_id:v2,block_id:b1,block_index:0,block_offset:0}]);
     await sb.from('audit_log').insert([{id:uuidv4(),user_id:uid,node_id:id,action:'version_create',details:{version_number:1},created_at:'2025-01-15T10:00:00Z'},{id:uuidv4(),user_id:uid,node_id:id,action:'version_create',details:{version_number:2},created_at:'2025-02-20T14:30:00Z'}]);
+    // Store demo content in Supabase Storage for preview/download
+    const demoContent = generateDemoContent(s.name, s.mime, s.size);
+    const storagePath = `${uid}/${id}/v2`;
+    await sb.storage.from('vault-files').upload(storagePath, demoContent, { contentType: s.mime, upsert: true }).catch(()=>{});
   }
   toast(t.seed_complete,'ok');
 }
@@ -621,43 +654,56 @@ function startRename(nodeId:string) {
 async function previewFile(nodeId:string) {
   const {data:node}=await sb.from('nodes').select('*').eq('id',nodeId).maybeSingle();if(!node)return;
   const ext=(node.name.split('.').pop()||'').toLowerCase();
-  const {data:extConfig}=await sb.from('file_extensions').select('*').eq('extension',ext).maybeSingle();
-  const viewerType=extConfig?.viewer_type||'text';
   const existing=document.getElementById('preview-panel');if(existing)existing.remove();
 
-  // Fetch version and block info for the file
-  const {data:versions}=await sb.from('file_versions').select('*').eq('node_id',nodeId).order('version_number',{ascending:false}).limit(5);
-  const currentVer=(versions||[])[0];
-  let blockInfo='';
-  if(currentVer){
-    const{data:blocks}=await sb.from('file_version_blocks').select('*,data_blocks(size,content_hash,compression)').eq('version_id',currentVer.id).order('block_index');
-    if(blocks&&blocks.length>0){
-      blockInfo=blocks.map((b:any)=>`<div style="display:flex;gap:8px;font-size:10px;padding:2px 0;border-bottom:1px solid var(--bg-2)"><span style="color:var(--text-3);width:20px">#${b.block_index}</span><span style="font-family:monospace;color:var(--accent);flex:1;overflow:hidden;text-overflow:ellipsis">${b.data_blocks?.content_hash?.substring(0,24)||'?'}...</span><span style="color:var(--text-3)">${fmtSize(b.data_blocks?.size||0)}</span><span class="badge ${b.data_blocks?.compression==='none'?'badge-arch':'badge-enc'}">${b.data_blocks?.compression||'?'}</span></div>`).join('');
-    }
-  }
-
   const panel=document.createElement('div');panel.className='preview-panel';panel.id='preview-panel';
+  panel.innerHTML=`<div class="preview-content"><div class="preview-head"><div class="preview-title">${esc(node.name)}</div><div style="display:flex;gap:4px"><button class="btn-sm primary" onclick="downloadFile('${nodeId}')">&#11015; Скачать</button><button class="btn-sm" onclick="closePreview()">Закрыть</button></div></div><div class="preview-body" style="align-items:center;justify-content:center"><div class="loading-spinner"></div></div></div>`;
+  document.body.appendChild(panel);panel.addEventListener('click',(e)=>{if(e.target===panel)closePreview();});
+
   const isImage=node.mime_type?.startsWith('image/');
   const isPdf=node.mime_type?.includes('pdf');
   const isText=node.mime_type?.startsWith('text/')||['md','txt','csv','json','xml','yaml','yml','log','cfg','ini','sh','bat','py','js','ts','css','html','sql'].includes(ext);
+  const isAudio=node.mime_type?.startsWith('audio/');
+  const isVideo=node.mime_type?.startsWith('video/');
 
   let body='';
-  if(isImage){
-    body=`<div class="preview-file-info"><div class="preview-icon">&#128444;</div><div class="preview-filename">${esc(node.name)}</div><div class="preview-meta">${esc(node.mime_type)} &middot; ${fmtSize(node.size)}</div><div style="margin-top:12px;color:var(--text-3);font-size:11px">Изображение хранится в зашифрованном виде. Скачайте файл для просмотра.</div></div>`;
-  } else if(isPdf){
-    body=`<div class="preview-file-info"><div class="preview-icon">&#128213;</div><div class="preview-filename">${esc(node.name)}</div><div class="preview-meta">${esc(node.mime_type)} &middot; ${fmtSize(node.size)}</div><div style="margin-top:12px;color:var(--text-3);font-size:11px">PDF хранится в зашифрованном виде. Скачайте файл для просмотра.</div></div>`;
-  } else if(isText){
-    body=`<div class="preview-file-info"><div class="preview-icon">&#128196;</div><div class="preview-filename">${esc(node.name)}</div><div class="preview-meta">${esc(node.mime_type)} &middot; ${fmtSize(node.size)}</div><div style="margin-top:12px;color:var(--text-3);font-size:11px">Текстовый файл хранится в зашифрованном виде. Скачайте файл для просмотра.</div></div>`;
-  } else {
-    body=`<div class="preview-file-info"><div class="preview-icon">&#128196;</div><div class="preview-filename">${esc(node.name)}</div><div class="preview-meta">${esc(node.mime_type||'Неизвестный тип')} &middot; ${fmtSize(node.size)}</div><div style="margin-top:12px;color:var(--text-3);font-size:11px">Файл хранится в зашифрованном виде. Скачайте для открытия.</div></div>`;
+  try {
+    const h = await vaultHeaders();
+    const res = await fetch(`${VAULT_API}/files/content?node_id=${nodeId}`, { headers: h });
+    const data = await res.json();
+
+    if (data.url) {
+      if (isImage) {
+        body=`<img src="${data.url}" alt="${esc(node.name)}" style="max-width:100%;max-height:100%;object-fit:contain" />`;
+      } else if (isPdf) {
+        body=`<iframe src="${data.url}" style="width:100%;height:100%;border:none"></iframe>`;
+      } else if (isAudio) {
+        body=`<div style="text-align:center;padding:40px"><div style="font-size:48px;opacity:0.3">&#127925;</div><audio controls src="${data.url}" style="margin-top:16px;width:80%;max-width:400px"><a href="${data.url}">Скачать аудио</a></audio><div style="margin-top:8px;font-size:11px;color:var(--text-3)">${esc(node.name)} &middot; ${fmtSize(node.size)}</div></div>`;
+      } else if (isVideo) {
+        body=`<video controls src="${data.url}" style="max-width:100%;max-height:100%"><a href="${data.url}">Скачать видео</a></video>`;
+      } else if (isText) {
+        // Fetch text content and display it
+        try {
+          const textRes = await fetch(data.url);
+          const text = await textRes.text();
+          const escaped = text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+          body=`<pre style="width:100%;font-size:12px;color:var(--text-1);white-space:pre-wrap;word-break:break-word;font-family:'IBM Plex Mono',monospace;overflow:auto;max-height:100%;padding:16px;background:var(--bg-1);border:1px solid var(--border);border-radius:var(--r-lg)">${escaped}</pre>`;
+        } catch {
+          body=`<div class="preview-file-info"><div class="preview-icon">&#128196;</div><div class="preview-filename">${esc(node.name)}</div><div class="preview-meta">${esc(node.mime_type)} &middot; ${fmtSize(node.size)}</div><div style="margin-top:12px"><a href="${data.url}" target="_blank" class="btn-sm primary">&#11015; Скачать</a></div></div>`;
+        }
+      } else {
+        body=`<div class="preview-file-info"><div class="preview-icon">&#128196;</div><div class="preview-filename">${esc(node.name)}</div><div class="preview-meta">${esc(node.mime_type||'Неизвестный тип')} &middot; ${fmtSize(node.size)}</div><div style="margin-top:12px"><a href="${data.url}" target="_blank" class="btn-sm primary">&#11015; Скачать файл</a></div></div>`;
+      }
+    } else {
+      // No content in storage - show metadata-only view
+      body=`<div class="preview-file-info"><div class="preview-icon">${isImage?'&#128444;':isPdf?'&#128213;':'&#128196;'}</div><div class="preview-filename">${esc(node.name)}</div><div class="preview-meta">${esc(node.mime_type||'?')} &middot; ${fmtSize(node.size)}</div><div style="margin-top:12px;color:var(--text-3);font-size:11px">Файл ещё не загружен в хранилище. Скачайте для просмотра.</div></div>`;
+    }
+  } catch(e: any) {
+    body=`<div class="preview-file-info"><div class="preview-icon">&#9888;</div><div class="preview-filename">${esc(node.name)}</div><div class="preview-meta" style="color:var(--red)">${esc(e.message||'Ошибка загрузки')}</div></div>`;
   }
 
-  const verHtml=(versions||[]).length>0?`<div style="margin-top:16px"><div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:var(--text-3);margin-bottom:6px">Версии (${(versions||[]).length})</div>${(versions||[]).map((v:any)=>`<div style="display:flex;gap:8px;font-size:11px;padding:3px 0;border-bottom:1px solid var(--bg-2)"><span style="font-weight:600">v${v.version_number}</span>${v.is_current?'<span class="badge badge-enc">текущая</span>':''}<span style="color:var(--text-3);flex:1">${fmtDate(v.created_at)}</span><span style="color:var(--text-3)">${fmtSize(v.total_size)}</span>${v.is_compressed?'<span class="badge badge-comp">сжат</span>':''}</div>`).join('')}</div>`:'';
-
-  const blockHtml=blockInfo?`<div style="margin-top:16px"><div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:var(--text-3);margin-bottom:6px">Блоки данных</div>${blockInfo}</div>`:'';
-
-  panel.innerHTML=`<div class="preview-content"><div class="preview-head"><div class="preview-title">${esc(node.name)}</div><div style="display:flex;gap:4px"><button class="btn-sm primary" onclick="downloadFile('${nodeId}')">&#11015; Скачать</button><button class="btn-sm" onclick="closePreview()">Закрыть</button></div></div><div class="preview-body" style="align-items:flex-start;justify-content:flex-start;overflow-y:auto;padding:20px">${body}${verHtml}${blockHtml}</div></div>`;
-  document.body.appendChild(panel);panel.addEventListener('click',(e)=>{if(e.target===panel)closePreview();});
+  const bodyEl=panel.querySelector('.preview-body');
+  if(bodyEl){bodyEl.style.alignItems='flex-start';bodyEl.style.justifyContent='flex-start';bodyEl.innerHTML=body;}
 }
 function closePreview(){const p=document.getElementById('preview-panel');if(p)p.remove();}
 (window as any).closePreview=closePreview;(window as any).previewFile=previewFile;
@@ -983,7 +1029,8 @@ function setupDropZone(){const zone=document.getElementById('drop-zone'),input=d
 async function handleFiles(fileList:FileList){for(const file of fileList)uploadQueue.push({file,progress:0});if(!isUploading)processUploadQueue();}
 async function processUploadQueue(){if(uploadQueue.length===0){isUploading=false;return;}isUploading=true;renderUploadProgress();while(uploadQueue.length>0){const item=uploadQueue[0];try{await uploadFileWithProgress(item);toast(`${t.upload_complete}: ${item.file.name}`,'ok');}catch(e:any){toast(`${t.upload_failed}: ${item.file.name}`,'err');}uploadQueue.shift();renderUploadProgress();}isUploading=false;invalidateNodesAndTreeCaches();loadFiles(currentParentId);loadTree();}
 function renderUploadProgress(){const el=document.getElementById('upload-progress');if(!el)return;if(uploadQueue.length===0){el.innerHTML='';return;}el.innerHTML=uploadQueue.map(item=>`<div style="background:var(--bg-1);border:1px solid var(--border);border-radius:var(--r);padding:4px 10px;margin-bottom:3px;display:flex;align-items:center;gap:6px"><span style="font-size:11px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(item.file.name)}</span><div class="progress-bar" style="width:60px"><div class="progress-fill" style="width:${item.progress}%"></div></div><span style="font-size:10px;color:var(--accent);width:28px;text-align:right">${item.progress}%</span></div>`).join('');}
-async function uploadFileWithProgress(item:{file:File;progress:number}){if(!currentUser)throw new Error('No user');const file=item.file;const buf=await file.arrayBuffer();const size=buf.byteLength;const id=uuidv4();item.progress=20;renderUploadProgress();const{error:nodeErr}=await sb.from('nodes').insert({id,parent_id:currentParentId,owner_id:currentUser.id,name:file.name,node_type:'file',path:`/${file.name}`,mime_type:file.type||'application/octet-stream',size});if(nodeErr)throw nodeErr;item.progress=40;renderUploadProgress();const hashBuf=await crypto.subtle.digest('SHA-256',buf);const hash=Array.from(new Uint8Array(hashBuf)).map(b=>b.toString(16).padStart(2,'0')).join('');item.progress=60;renderUploadProgress();const vid=uuidv4();await sb.from('file_versions').insert({id:vid,node_id:id,version_number:1,total_size:size,content_hash:hash,encrypted_key:new Uint8Array(32),key_nonce:new Uint8Array(24),is_current:true,is_compressed:false,created_by:currentUser.id,comment:'Загружен'});item.progress=75;renderUploadProgress();const bid=uuidv4();await sb.from('data_blocks').insert({id:bid,content_hash:hash,encrypted_hash:hash,size,encrypted_size:size+16,physical_path:`/vault/blocks/${hash.substring(0,2)}/${hash}`,compression:'none',ref_count:1});await sb.from('file_version_blocks').insert({id:uuidv4(),version_id:vid,block_id:bid,block_index:0,block_offset:0});item.progress=90;renderUploadProgress();await sb.from('audit_log').insert({id:uuidv4(),user_id:currentUser.id,node_id:id,action:'version_create',details:{version_number:1,size}});item.progress=100;renderUploadProgress();}
+async function uploadFileWithProgress(item:{file:File;progress:number}){if(!currentUser)throw new Error('No user');const file=item.file;const buf=await file.arrayBuffer();const size=buf.byteLength;const id=uuidv4();item.progress=15;renderUploadProgress();const{error:nodeErr}=await sb.from('nodes').insert({id,parent_id:currentParentId,owner_id:currentUser.id,name:file.name,node_type:'file',path:`/${file.name}`,mime_type:file.type||'application/octet-stream',size});if(nodeErr)throw nodeErr;item.progress=30;renderUploadProgress();const hashBuf=await crypto.subtle.digest('SHA-256',buf);const hash=Array.from(new Uint8Array(hashBuf)).map(b=>b.toString(16).padStart(2,'0')).join('');item.progress=45;renderUploadProgress();const vid=uuidv4();await sb.from('file_versions').insert({id:vid,node_id:id,version_number:1,total_size:size,content_hash:hash,encrypted_key:new Uint8Array(32),key_nonce:new Uint8Array(24),is_current:true,is_compressed:false,created_by:currentUser.id,comment:'Загружен'});item.progress=55;renderUploadProgress();const bid=uuidv4();await sb.from('data_blocks').insert({id:bid,content_hash:hash,encrypted_hash:hash,size,encrypted_size:size+16,physical_path:`/vault/blocks/${hash.substring(0,2)}/${hash}`,compression:'none',ref_count:1});await sb.from('file_version_blocks').insert({id:uuidv4(),version_id:vid,block_id:bid,block_index:0,block_offset:0});item.progress=65;renderUploadProgress();// Store actual file content in Supabase Storage for preview/download
+const storagePath=`${currentUser.id}/${id}/v1`;const{error:storageErr}=await sb.storage.from('vault-files').upload(storagePath,file,{contentType:file.type||'application/octet-stream',upsert:true});if(storageErr)console.warn('Storage upload failed (non-fatal):',storageErr.message);item.progress=85;renderUploadProgress();await sb.from('audit_log').insert({id:uuidv4(),user_id:currentUser.id,node_id:id,action:'version_create',details:{version_number:1,size}});item.progress=100;renderUploadProgress();}
 (window as any).triggerUpload=()=>{(document.getElementById('file-input') as HTMLInputElement).click();};
 (window as any).createFolder=async()=>{
   if(!currentUser)return;
@@ -1052,7 +1099,28 @@ async function openDetail(nodeId:string) {
 (window as any).deleteFile=async(nodeId:string)=>{if(!confirm(t.delete_confirm))return;optimisticRemoveRow(nodeId);try{await softDeleteNode(nodeId,currentUser.id);invalidateNodesAndTreeCaches();toast(t.delete,'ok');document.getElementById('detail')!.style.display='none';loadTree();if(currentView==='files')loadFiles(currentParentId);}catch(e:any){toast(e.message,'err');loadView(currentView);}};
 (window as any).archiveFile=async(nodeId:string)=>{optimisticRemoveRow(nodeId);try{await sb.from('nodes').update({is_archived:true,updated_at:new Date().toISOString()}).eq('id',nodeId);await sb.from('audit_log').insert({id:uuidv4(),user_id:currentUser.id,node_id:nodeId,action:'archive_files',details:{}});invalidateNodesAndTreeCaches();toast(t.archive_btn,'ok');document.getElementById('detail')!.style.display='none';loadTree();if(currentView==='files')loadFiles(currentParentId);}catch(e:any){toast(e.message,'err');loadView(currentView);}};
 (window as any).unarchiveFileAction=async(nodeId:string)=>{try{await unarchiveFile(nodeId);invalidateNodesAndTreeCaches();toast(t.unarchive_btn,'ok');if(currentView==='archived')loadArchived();else if(currentView==='files')loadFiles(currentParentId);loadTree();}catch(e:any){toast(e.message,'err');}};
-(window as any).downloadFile=async(nodeId:string)=>{const{data:node}=await sb.from('nodes').select('name,mime_type').eq('id',nodeId).maybeSingle();if(!node)return;const blob=new Blob([`Vault PLM placeholder: ${node.name}`],{type:node.mime_type||'application/octet-stream'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=node.name;a.click();URL.revokeObjectURL(url);};
+(window as any).downloadFile=async(nodeId:string)=>{
+  const{data:node}=await sb.from('nodes').select('name,mime_type').eq('id',nodeId).maybeSingle();if(!node)return;
+  try{
+    const h=await vaultHeaders();
+    const res=await fetch(`${VAULT_API}/files/content?node_id=${nodeId}`,{headers:h});
+    const data=await res.json();
+    if(data.url){
+      // Fetch actual content from signed URL
+      const fileRes=await fetch(data.url);
+      if(fileRes.ok){
+        const blob=await fileRes.blob();
+        const url=URL.createObjectURL(blob);
+        const a=document.createElement('a');a.href=url;a.download=node.name;a.click();
+        URL.revokeObjectURL(url);
+        return;
+      }
+    }
+  }catch{/* fall through to placeholder */}
+  // Fallback: placeholder download
+  const blob=new Blob([`Vault PLM: ${node.name}`],{type:node.mime_type||'application/octet-stream'});
+  const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=node.name;a.click();URL.revokeObjectURL(url);
+};
 (window as any).lockFile=async(nodeId:string)=>{try{const result=await acquireFileLock(nodeId,currentUser.id,30000);if(result.acquired)toast(t.lock_acquired,'ok');else toast(t.lock_failed,'err');}catch(e:any){toast(e.message,'err');}};
 (window as any).restoreVer=async(nodeId:string,vn:number)=>{try{await restoreFileVersion(nodeId,vn,currentUser.id);toast(`${t.version_restored}: v${vn}`,'ok');openDetail(nodeId);}catch(e:any){toast(e.message,'err');}};
 (window as any).revokeAccess=async(nodeId:string,userId:string)=>{try{await revokePermission(currentUser.id,userId,nodeId);toast(t.revoke_access,'ok');openDetail(nodeId);}catch(e:any){toast(e.message,'err');}};

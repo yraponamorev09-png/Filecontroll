@@ -663,6 +663,54 @@ async function restoreBackupHandler(sb: ReturnType<typeof createClient>, body: {
   });
 }
 
+// --- File Content: Generate signed URL for preview/download ---
+
+async function getFileContentHandler(
+  sb: ReturnType<typeof createClient>,
+  sbAdmin: ReturnType<typeof createClient>,
+  url: URL,
+  verifiedUserId: string,
+) {
+  const nodeId = url.searchParams.get("node_id");
+  const versionNumber = url.searchParams.get("version");
+  if (!nodeId) return errorResponse("node_id required", "MISSING_PARAM", 400);
+
+  const perm = await evaluateNodePermission(sb, verifiedUserId, nodeId, "read");
+  if (perm.notFound) return errorResponse("Node not found", "NODE_NOT_FOUND", 404);
+  if (!perm.allowed) return errorResponse("Forbidden", "FORBIDDEN", 403);
+
+  const { data: node } = await sb.from("nodes").select("id, name, mime_type, owner_id").eq("id", nodeId).maybeSingle();
+  if (!node) return errorResponse("Node not found", "NOT_FOUND", 404);
+
+  // Find the version
+  let versionQuery = sb.from("file_versions").select("id, version_number").eq("node_id", nodeId);
+  if (versionNumber) {
+    versionQuery = versionQuery.eq("version_number", parseInt(versionNumber));
+  } else {
+    versionQuery = versionQuery.eq("is_current", true);
+  }
+  const { data: version } = await versionQuery.maybeSingle();
+  if (!version) return errorResponse("Version not found", "VERSION_NOT_FOUND", 404);
+
+  // Generate signed URL from storage
+  const storagePath = `${node.owner_id}/${nodeId}/v${version.version_number}`;
+  const { data: signedUrlData, error: urlError } = await sbAdmin.storage
+    .from("vault-files")
+    .createSignedUrl(storagePath, 3600); // 1 hour
+
+  if (urlError || !signedUrlData?.signedUrl) {
+    return errorResponse("File content not available in storage", "NO_CONTENT", 404);
+  }
+
+  return jsonResponse({
+    node_id: nodeId,
+    name: node.name,
+    mime_type: node.mime_type,
+    version_number: version.version_number,
+    url: signedUrlData.signedUrl,
+  });
+}
+
 // --- Router ---
 
 Deno.serve(async (req: Request) => {
@@ -763,6 +811,11 @@ Deno.serve(async (req: Request) => {
     if (req.method === "POST" && path === "/backups/restore") {
       const body = await req.json();
       return await restoreBackupHandler(sb, body, authUserId);
+    }
+
+    // --- File Content (signed URL for preview/download) ---
+    if (req.method === "GET" && path === "/files/content") {
+      return await getFileContentHandler(sbUser, sb, url, authUserId);
     }
 
     // --- File Integrity Check ---
