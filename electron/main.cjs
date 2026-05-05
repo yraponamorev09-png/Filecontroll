@@ -2,6 +2,13 @@ const { app, BrowserWindow, Menu, shell } = require('electron');
 const path = require('path');
 
 let mainWindow;
+let isDev = false;
+
+function sendMenuAction(action) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('menu-action', action);
+  }
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -10,6 +17,8 @@ function createWindow() {
     minWidth: 800,
     minHeight: 600,
     title: 'Vault DMS',
+    show: false,
+    backgroundColor: '#0a0b10',
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
@@ -17,10 +26,9 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.cjs'),
     },
     titleBarStyle: 'default',
-    backgroundColor: '#0a0b10',
   });
 
-  const isDev = process.env.NODE_ENV === 'development' || process.argv.includes('--dev');
+  isDev = process.env.NODE_ENV === 'development' || process.argv.includes('--dev');
 
   if (isDev) {
     mainWindow.loadURL('http://localhost:5173');
@@ -28,6 +36,13 @@ function createWindow() {
   } else {
     mainWindow.loadFile(path.join(__dirname, '..', 'dist-web', 'index.html'));
   }
+
+  mainWindow.once('ready-to-show', () => {
+    if (!mainWindow.isDestroyed()) {
+      mainWindow.show();
+      mainWindow.focus();
+    }
+  });
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith('http://') || url.startsWith('https://')) {
@@ -38,52 +53,55 @@ function createWindow() {
 
   const template = [
     {
-      label: 'Файл',
+      label: 'File',
       submenu: [
-        { label: 'Загрузить файл', click: () => mainWindow.webContents.send('menu-upload') },
-        { label: 'Новая папка', click: () => mainWindow.webContents.send('menu-new-folder') },
+        { label: 'Upload file', accelerator: 'Ctrl+O', click: () => sendMenuAction('upload') },
+        { label: 'New folder', accelerator: 'Ctrl+Shift+N', click: () => sendMenuAction('new-folder') },
         { type: 'separator' },
-        { role: 'quit', label: 'Выход' },
+        { role: 'quit', label: 'Exit' },
       ],
     },
     {
-      label: 'Редактирование',
+      label: 'Edit',
       submenu: [
-        { role: 'undo', label: 'Отменить' },
-        { role: 'redo', label: 'Повторить' },
+        { role: 'undo', label: 'Undo' },
+        { role: 'redo', label: 'Redo' },
         { type: 'separator' },
-        { role: 'cut', label: 'Вырезать' },
-        { role: 'copy', label: 'Копировать' },
-        { role: 'paste', label: 'Вставить' },
-        { role: 'selectAll', label: 'Выделить всё' },
+        { role: 'cut', label: 'Cut' },
+        { role: 'copy', label: 'Copy' },
+        { role: 'paste', label: 'Paste' },
+        { role: 'selectAll', label: 'Select all' },
       ],
     },
     {
-      label: 'Вид',
+      label: 'View',
       submenu: [
-        { role: 'reload', label: 'Обновить' },
-        { role: 'forceReload', label: 'Принудительное обновление' },
-        { role: 'toggleDevTools', label: 'Инструменты разработчика' },
+        { role: 'reload', label: 'Reload', accelerator: 'Ctrl+R' },
+        { role: 'forceReload', label: 'Force reload', accelerator: 'Ctrl+Shift+R' },
+        { role: 'toggleDevTools', label: 'Developer tools', accelerator: 'F12' },
         { type: 'separator' },
-        { role: 'resetZoom', label: 'Сбросить масштаб' },
-        { role: 'zoomIn', label: 'Увеличить' },
-        { role: 'zoomOut', label: 'Уменьшить' },
+        { role: 'resetZoom', label: 'Reset zoom' },
+        { role: 'zoomIn', label: 'Zoom in' },
+        { role: 'zoomOut', label: 'Zoom out' },
         { type: 'separator' },
-        { role: 'togglefullscreen', label: 'Полный экран' },
+        { role: 'togglefullscreen', label: 'Fullscreen' },
       ],
     },
     {
-      label: 'Справка',
+      label: 'Help',
       submenu: [
-        { label: 'О Vault DMS', click: () => {
-          const { dialog } = require('electron');
-          dialog.showMessageBox(mainWindow, {
-            type: 'info',
-            title: 'О Vault DMS',
-            message: 'Vault DMS v1.0.0',
-            detail: 'Система управления документами с шифрованием, версионностью и совместной работой.',
-          });
-        }},
+        {
+          label: 'About Vault DMS',
+          click: () => {
+            const { dialog } = require('electron');
+            dialog.showMessageBox(mainWindow, {
+              type: 'info',
+              title: 'About Vault DMS',
+              message: 'Vault DMS v1.0.0',
+              detail: 'Document management system with encryption, versioning, and collaboration.',
+            });
+          },
+        },
       ],
     },
   ];

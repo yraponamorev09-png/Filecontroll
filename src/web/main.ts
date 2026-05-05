@@ -50,6 +50,16 @@ let activeEditingNodeId: string | null = null;
 let presenceUsers: any[] = [];
 let cursorStates: Record<string, { node_id: string | null; field: string; pos: number; line?: number; col?: number; typing: boolean; email?: string; full_name?: string; ts: string }> = {};
 let cursorFadeTimers: Record<string, any> = {};
+type DesktopMenuAction = 'upload' | 'new-folder';
+type DesktopBridge = {
+  isElectron: boolean;
+  platform: string;
+  getVersion?: () => string;
+  onMenuAction?: (handler: (action: DesktopMenuAction) => void) => () => void;
+};
+const desktopBridge = (window as any).electronAPI as DesktopBridge | undefined;
+const isDesktopApp = !!desktopBridge?.isElectron;
+let desktopMenuCleanup: (() => void) | null = null;
 
 // --- i18n ---
 const t: Record<string, string> = {
@@ -166,6 +176,48 @@ function hideLoading() {
   if (loadingOverlay) { loadingOverlay.remove(); loadingOverlay = null; }
 }
 
+function setupDesktopBridge() {
+  if (!isDesktopApp) return;
+  const statusEl = document.getElementById('desktop-status') as HTMLElement | null;
+  const version = desktopBridge?.getVersion?.() || '';
+  const platform = desktopBridge?.platform || '';
+  if (statusEl) {
+    statusEl.style.display = 'inline-flex';
+    statusEl.textContent = [version ? `v${version}` : '', platform].filter(Boolean).join(' · ');
+  }
+  document.body.dataset.desktop = 'true';
+  document.title = version ? `Vault PLM v${version}` : 'Vault PLM';
+  if (desktopMenuCleanup) {
+    desktopMenuCleanup();
+    desktopMenuCleanup = null;
+  }
+  if (desktopBridge?.onMenuAction) {
+    desktopMenuCleanup = desktopBridge.onMenuAction((action) => {
+      if (action === 'upload') {
+        (window as any).triggerUpload?.();
+      } else if (action === 'new-folder') {
+        (window as any).createFolder?.();
+      }
+    });
+  }
+}
+
+async function bootstrapWorkspace() {
+  showLoading('Подготовка рабочего пространства...');
+  try {
+    await seedIfEmpty();
+    renderNav();
+    loadTree();
+    setupSearch();
+    setupKeyboard();
+    setupGlobalClicks();
+    loadView('products');
+    setupRealtimeSubscriptions();
+  } finally {
+    hideLoading();
+  }
+}
+
 async function hashFileInBackground(buf: ArrayBuffer): Promise<string> {
   const hashBuf = await crypto.subtle.digest('SHA-256', buf);
   return Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
@@ -240,19 +292,29 @@ async function ensureFolderChildrenCached(parentKey: string, dbParentId: string 
 
 // --- Init ---
 async function init() {
+  setupDesktopBridge();
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) { showConnectionSetup(); return; }
-  const state = await auth.init();
-  if (state.mfaRequired) { showMFAVerify(); return; }
-  if (!state.user) { showLoginScreen(); return; }
-  currentUser = { id: state.user.id, email: state.user.email, ...state.profile };
-  await seedIfEmpty();
-  renderNav();
-  loadTree();
-  setupSearch();
-  setupKeyboard();
-  setupGlobalClicks();
-  loadView('products');
-  setupRealtimeSubscriptions();
+  showLoading('Запуск Vault PLM...');
+  try {
+    updateLoading('Подключение к хранилищу...');
+    const state = await auth.init();
+    if (state.mfaRequired) {
+      hideLoading();
+      showMFAVerify();
+      return;
+    }
+    if (!state.user) {
+      hideLoading();
+      showLoginScreen();
+      return;
+    }
+    currentUser = { id: state.user.id, email: state.user.email, ...state.profile };
+    await bootstrapWorkspace();
+  } catch (e: any) {
+    hideLoading();
+    toast(e.message || 'Ошибка запуска', 'err');
+    showLoginScreen();
+  }
 }
 
 async function setEditingNode(nodeId: string | null) {
@@ -399,8 +461,7 @@ function showConnectionSetup() {
   if (result.mfaRequired) { showMFAVerify(); return; }
   const state = auth.getState();
   currentUser = { id: state.user.id, email: state.user.email, ...state.profile };
-  await seedIfEmpty();
-  renderNav(); loadTree(); setupSearch(); setupKeyboard(); setupGlobalClicks(); loadView('products'); setupRealtimeSubscriptions();
+  await bootstrapWorkspace();
 };
 
 (window as any).handleRegister = async () => {
@@ -426,8 +487,7 @@ function showConnectionSetup() {
   if (result.error) { errEl.textContent = result.error; errEl.style.display = 'block'; return; }
   const state = auth.getState();
   currentUser = { id: state.user.id, email: state.user.email, ...state.profile };
-  await seedIfEmpty();
-  renderNav(); loadTree(); setupSearch(); setupKeyboard(); setupGlobalClicks(); loadView('products'); setupRealtimeSubscriptions();
+  await bootstrapWorkspace();
 };
 
 (window as any).handleResetPassword = async () => {

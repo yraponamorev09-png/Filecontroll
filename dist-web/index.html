@@ -84,6 +84,7 @@
     .search-box input::placeholder{color:var(--text-3)}
     .search-box .search-ic{position:absolute;left:8px;top:50%;transform:translateY(-50%);font-size:11px;color:var(--text-3)}
     .topbar-actions{margin-left:auto;display:flex;gap:6px;flex-shrink:0}
+    .desktop-status{margin-left:8px;padding:4px 8px;border:1px solid var(--border);border-radius:999px;background:var(--bg-2);color:var(--text-2);font-size:10px;font-weight:600;letter-spacing:0.04em;text-transform:uppercase;white-space:nowrap}
     .btn-sm{padding:4px 10px;border-radius:var(--r);border:1px solid var(--border);background:var(--bg-1);color:var(--text-1);font-size:12px;font-weight:500;transition:all .1s;display:flex;align-items:center;gap:4px;white-space:nowrap}
     .btn-sm:hover{background:var(--bg-hover);border-color:var(--border-light)}
     .btn-sm.primary{background:var(--accent);border-color:var(--accent);color:#fff}
@@ -321,7 +322,7 @@
     @media(max-width:900px){.sidebar{width:48px}.sidebar .nav-label,.sidebar .logo span,.sidebar .nav-btn span:not(.ic),.sidebar .user-avatar,.sidebar-foot{display:none}.sidebar .nav-btn{justify-content:center;padding:8px}.sidebar .logo{justify-content:center}.tree-panel{display:none}.detail{width:280px}}
     @media(max-width:640px){.sidebar{display:none}.file-row .fr-date{display:none}.detail{position:fixed;right:0;top:0;bottom:0;width:100%;z-index:50}.search-box{display:none}}
   </style>
-  <script type="module" crossorigin src="/assets/index-D7HcrPLG.js"></script>
+  <script type="module" crossorigin src="/assets/index-BLDJyWwB.js"></script>
 </head>
 <body>
 <div class="app" id="app">
@@ -339,6 +340,7 @@
       <button class="btn-back" id="btn-back" style="display:none" onclick="goBack()">&#8592; Назад</button>
       <div class="breadcrumb" id="bc"></div>
       <div class="search-box"><span class="search-ic">&#128269;</span><input type="text" id="search-input" placeholder="Поиск..." /></div>
+      <div class="desktop-status" id="desktop-status" style="display:none"></div>
       <div class="topbar-actions" id="topbar-actions"></div>
       <button class="btn-sm" id="theme-toggle" onclick="toggleTheme()" title="Сменить тему">&#9790;</button>
     </div>
