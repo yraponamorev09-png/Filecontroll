@@ -41,7 +41,7 @@
  * - Conflict resolution strategies: keep_both, last_writer_wins, manual
  */
 
-import { saveFileVersion, checkPermission, createShareLink, archiveOldVersions } from './core/index.js';
+import { saveFileVersion, checkPermission, createShareLink, archiveOldVersions } from './core/index.ts';
 
 async function demo() {
   console.log('Vault DMS initialized');

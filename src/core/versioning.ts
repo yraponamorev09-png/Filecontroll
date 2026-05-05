@@ -1,14 +1,14 @@
 import { v4 as uuidv4 } from 'uuid';
-import { getSupabaseClient } from '../utils/db.js';
-import { hashContent, splitIntoBlocks, BLOCK_SIZE } from '../utils/crypto.js';
+import { getSupabaseClient } from '../utils/db.ts';
+import { hashContent, splitIntoBlocks, BLOCK_SIZE } from '../utils/crypto.ts';
 import type {
   Node,
   FileVersion,
   DataBlock,
   FileVersionBlock,
   SaveVersionResult,
-} from '../types/index.js';
-import { NodeNotFoundError, VersionConflictError, VaultError } from '../types/index.js';
+} from '../types/index.ts';
+import { NodeNotFoundError, VersionConflictError, VaultError } from '../types/index.ts';
 
 const BLOCK_SIZE_BYTES = BLOCK_SIZE;
 

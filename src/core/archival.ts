@@ -1,7 +1,7 @@
 import { v4 as uuidv4 } from 'uuid';
-import { getSupabaseClient } from '../utils/db.js';
-import type { Node, FileVersion } from '../types/index.js';
-import { VaultError } from '../types/index.js';
+import { getSupabaseClient } from '../utils/db.ts';
+import type { Node, FileVersion } from '../types/index.ts';
+import { VaultError } from '../types/index.ts';
 
 /**
  * Archival policy: move old/rarely-used file versions to compressed storage.

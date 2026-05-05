@@ -1,7 +1,7 @@
 import { v4 as uuidv4 } from 'uuid';
-import { getSupabaseClient } from '../utils/db.js';
-import type { Action, Permission, PermissionCheckResult, AccessControlEntry, Node } from '../types/index.js';
-import { NodeNotFoundError, PermissionDeniedError, VaultError } from '../types/index.js';
+import { getSupabaseClient } from '../utils/db.ts';
+import type { Action, Permission, PermissionCheckResult, AccessControlEntry, Node } from '../types/index.ts';
+import { NodeNotFoundError, PermissionDeniedError, VaultError } from '../types/index.ts';
 
 /**
  * Permission hierarchy: admin > write > read

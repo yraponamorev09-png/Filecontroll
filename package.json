@@ -1,15 +1,17 @@
 {
   "name": "starter",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
-    "start": "tsx src/main.ts",
-    "test": "tsx src/test.ts"
+    "build": "vite build --configLoader native --config vite.config.mjs",
+    "start": "npm run build && electron .",
+    "demo": "node --no-warnings --experimental-transform-types src/main.ts",
+    "test": "node --experimental-strip-types src/test.mjs"
   },
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "electron/main.cjs",
   "keywords": [],
   "author": "",
   "license": "ISC",
@@ -21,7 +23,7 @@
   "devDependencies": {
     "@types/node": "^25.6.0",
     "@types/uuid": "^10.0.0",
-    "tsx": "^4.21.0",
+    "electron": "^41.5.0",
     "typescript": "^6.0.3"
   }
 }

@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from 'uuid';
-import { getSupabaseClient } from '../utils/db.js';
-import { VaultError, VersionConflictError } from '../types/index.js';
+import { getSupabaseClient } from '../utils/db.ts';
+import { VaultError, VersionConflictError } from '../types/index.ts';
 
 /**
  * Concurrency and conflict resolution for the Vault DMS.

@@ -382,9 +382,65 @@ VITE_SUPABASE_ANON_KEY=your-anon-key
 | Хеширование | SHA-256, PBKDF2, bcrypt |
 | CAS-хранилище | Поблочное, 4MB блоки |
 
+## Working Agreement
+
+This is the active operating contract for our collaboration.
+
+- I work one block at a time.
+- Each block must have a clear definition of done before implementation starts.
+- After each block I run the relevant checks: build, tests, and desktop start when applicable.
+- If a block exposes hidden dependencies, I stabilize those before moving on.
+- I keep the next block short, testable, and shippable.
+- Desktop entrypoints are `electron/main.cjs` and `electron/preload.cjs`.
+- `npm start` launches the packaged desktop flow, `npm run dev` stays web-only, and `npm run demo` is the lightweight CLI check.
+
+## Active Roadmap
+
+### 1. Desktop UX
+
+- Real Electron app startup flow
+- App menu and window behavior
+- Safe desktop actions from the renderer
+- Better launch and loading states
+
+### 2. File Workflow
+
+- Upload
+- Preview
+- Rename
+- Move
+- Delete and restore
+- File detail panel cleanup
+
+### 3. PLM Block
+
+- Product detail screen
+- BOM editor
+- Workflow UI
+- Revision and status actions
+
+### 4. Collaboration
+
+- Comments and mentions
+- Presence and online state
+- Realtime updates where they matter
+
+### 5. Hardening and Polish
+
+- Permission edge cases
+- Error states and empty states
+- Performance pass
+- Documentation cleanup
+
+### Working Rule
+
+The active roadmap above overrides the legacy roadmap above. If we change direction later, we update this section first and keep the rest of the work aligned to it.
+
 ---
 
-## Дорожная карта
+## Legacy Roadmap
+
+This section is kept for historical context only. Use the Active Roadmap above for current work.
 
 ### Этап 1 -- Фундамент (завершено)
 

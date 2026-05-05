@@ -1,9 +1,9 @@
 import { v4 as uuidv4 } from 'uuid';
-import { getSupabaseClient } from '../utils/db.js';
-import { generateToken, hashPassword, verifyPassword } from '../utils/crypto.js';
-import type { ShareLink, ShareLinkResult } from '../types/index.js';
-import { VaultError, ShareLinkExpiredError, PermissionDeniedError } from '../types/index.js';
-import { assertPermission } from './access.js';
+import { getSupabaseClient } from '../utils/db.ts';
+import { generateToken, hashPassword, verifyPassword } from '../utils/crypto.ts';
+import type { ShareLink, ShareLinkResult } from '../types/index.ts';
+import { VaultError, ShareLinkExpiredError, PermissionDeniedError } from '../types/index.ts';
+import { assertPermission } from './access.ts';
 
 /**
  * Create a secure share link for a node.

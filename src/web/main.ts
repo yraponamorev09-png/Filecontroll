@@ -6,14 +6,14 @@ import {
   createShareLink, revokeShareLink,
   archiveOldVersions, unarchiveFile, softDeleteNode, purgeDeletedNodes,
   detectConflict, resolveConflict, acquireFileLock, releaseFileLock,
-} from '../core/index.js';
-import type { Permission } from '../types/index.js';
-import { AuthService } from './auth.js';
+} from '../core/index.ts';
+import type { Permission } from '../types/index.ts';
+import { AuthService } from './auth.ts';
 import {
   subscribeToTable, unsubscribeAll, joinPresence, leavePresence,
   joinEditingChannel, broadcastEditingState, broadcastEditingCursor, leaveEditingChannel,
-} from '../utils/realtime.js';
-import { cacheGet, cacheSet, cacheInvalidate, cacheClear, dedupFetch } from '../utils/cache.js';
+} from '../utils/realtime.ts';
+import { cacheGet, cacheSet, cacheInvalidate, cacheClear, dedupFetch } from '../utils/cache.ts';
 
 // --- Supabase client (uses .env, auth is handled by Supabase Auth) ---
 const SUPABASE_URL = (import.meta as any).env?.VITE_SUPABASE_URL ?? '';
@@ -166,41 +166,9 @@ function hideLoading() {
   if (loadingOverlay) { loadingOverlay.remove(); loadingOverlay = null; }
 }
 
-// --- Background worker for heavy file ops ---
-let uploadWorker: Worker | null = null;
-let uploadWorkerReqId = 0;
-const uploadWorkerPending = new Map<number, { resolve: (hash: string) => void; reject: (err: Error) => void }>();
-
-function getUploadWorker(): Worker | null {
-  if (typeof Worker === 'undefined') return null;
-  if (uploadWorker) return uploadWorker;
-  uploadWorker = new Worker(new URL('./file-worker.ts', import.meta.url), { type: 'module' });
-  uploadWorker.onmessage = (event: MessageEvent<any>) => {
-    const data = event.data || {};
-    const req = uploadWorkerPending.get(data.id);
-    if (!req) return;
-    uploadWorkerPending.delete(data.id);
-    if (data.ok && data.hash) req.resolve(data.hash);
-    else req.reject(new Error(data.error || 'Worker hash error'));
-  };
-  uploadWorker.onerror = (ev: ErrorEvent) => {
-    uploadWorkerPending.forEach(({ reject }) => reject(new Error(ev.message || 'Upload worker failed')));
-    uploadWorkerPending.clear();
-  };
-  return uploadWorker;
-}
-
 async function hashFileInBackground(buf: ArrayBuffer): Promise<string> {
-  const worker = getUploadWorker();
-  if (!worker) {
-    const hashBuf = await crypto.subtle.digest('SHA-256', buf);
-    return Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
-  }
-  const id = ++uploadWorkerReqId;
-  return await new Promise<string>((resolve, reject) => {
-    uploadWorkerPending.set(id, { resolve, reject });
-    worker.postMessage({ type: 'hash', id, buffer: buf }, [buf]);
-  });
+  const hashBuf = await crypto.subtle.digest('SHA-256', buf);
+  return Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
 // --- Optimistic UI helpers ---
@@ -1182,7 +1150,7 @@ function setupDropZone(){const zone=document.getElementById('drop-zone'),input=d
 async function handleFiles(fileList:FileList){for(const file of fileList)uploadQueue.push({file,progress:0});if(!isUploading)processUploadQueue();}
 async function processUploadQueue(){if(uploadQueue.length===0){isUploading=false;return;}isUploading=true;renderUploadProgress();while(uploadQueue.length>0){const item=uploadQueue[0];try{await uploadFileWithProgress(item);toast(`${t.upload_complete}: ${item.file.name}`,'ok');}catch(e:any){toast(`${t.upload_failed}: ${item.file.name}`,'err');}uploadQueue.shift();renderUploadProgress();}isUploading=false;invalidateNodesAndTreeCaches();loadFiles(currentParentId);loadTree();}
 function renderUploadProgress(){const el=document.getElementById('upload-progress');if(!el)return;if(uploadQueue.length===0){el.innerHTML='';return;}el.innerHTML=uploadQueue.map(item=>`<div style="background:var(--bg-1);border:1px solid var(--border);border-radius:var(--r);padding:4px 10px;margin-bottom:3px;display:flex;align-items:center;gap:6px"><span style="font-size:11px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(item.file.name)}</span><div class="progress-bar" style="width:60px"><div class="progress-fill" style="width:${item.progress}%"></div></div><span style="font-size:10px;color:var(--accent);width:28px;text-align:right">${item.progress}%</span></div>`).join('');}
-async function uploadFileWithProgress(item:{file:File;progress:number}){if(!currentUser)throw new Error('No user');const file=item.file;const buf=await file.arrayBuffer();const size=buf.byteLength;const id=uuidv4();item.progress=15;renderUploadProgress();const{error:nodeErr}=await sb.from('nodes').insert({id,parent_id:currentParentId,owner_id:currentUser.id,name:file.name,node_type:'file',path:`/${file.name}`,mime_type:file.type||'application/octet-stream',size});if(nodeErr)throw nodeErr;item.progress=30;renderUploadProgress();const hash=await hashFileInBackground(buf);item.progress=45;renderUploadProgress();const vid=uuidv4();await sb.from('file_versions').insert({id:vid,node_id:id,version_number:1,total_size:size,content_hash:hash,encrypted_key:new Uint8Array(32),key_nonce:new Uint8Array(24),is_current:true,is_compressed:false,created_by:currentUser.id,comment:'Загружен'});item.progress=55;renderUploadProgress();const bid=uuidv4();await sb.from('data_blocks').insert({id:bid,content_hash:hash,encrypted_hash:hash,size,encrypted_size:size+16,physical_path:`/vault/blocks/${hash.substring(0,2)}/${hash}`,compression:'none',ref_count:1});await sb.from('file_version_blocks').insert({id:uuidv4(),version_id:vid,block_id:bid,block_index:0,block_offset:0});item.progress=65;renderUploadProgress();// Store actual file content in Supabase Storage for preview/download
+async function uploadFileWithProgress(item:{file:File;progress:number}){if(!currentUser)throw new Error('No user');const file=item.file;const buf=await file.arrayBuffer();const size=buf.byteLength;const id=uuidv4();item.progress=15;renderUploadProgress();const{error:nodeErr}=await sb.from('nodes').insert({id,parent_id:currentParentId,owner_id:currentUser.id,name:file.name,node_type:'file',path:`/${file.name}`,mime_type:file.type||'application/octet-stream',size});if(nodeErr)throw nodeErr;item.progress=30;renderUploadProgress();const hash=await hashFileInBackground(buf);item.progress=45;renderUploadProgress();const vid=uuidv4();await sb.from('file_versions').insert({id:vid,node_id:id,version_number:1,total_size:size,content_hash:hash,encrypted_key:new Uint8Array(32),key_nonce:new Uint8Array(24),is_current:true,is_compressed:false,created_by:currentUser.id,comment:'Загружен'});item.progress=55;renderUploadProgress();const physicalPath=`/vault/blocks/${hash.substring(0,2)}/${hash}`;const{data:existingBlock,error:existingErr}=await sb.from('data_blocks').select('id, ref_count').eq('content_hash',hash).limit(1);if(existingErr)throw existingErr;let bid:string;if(existingBlock&&existingBlock.length>0){bid=existingBlock[0].id;await sb.from('data_blocks').update({ref_count:(existingBlock[0].ref_count||0)+1}).eq('id',bid);}else{bid=uuidv4();const{error:blockErr}=await sb.from('data_blocks').insert({id:bid,content_hash:hash,encrypted_hash:hash,size,encrypted_size:size+16,physical_path:physicalPath,compression:'none',ref_count:1});if(blockErr)throw blockErr;}await sb.from('file_version_blocks').insert({id:uuidv4(),version_id:vid,block_id:bid,block_index:0,block_offset:0});item.progress=65;renderUploadProgress();// Store actual file content in Supabase Storage for preview/download
 const storagePath=`${currentUser.id}/${id}/1`;const{error:storageErr}=await sb.storage.from('vault-files').upload(storagePath,file,{contentType:file.type||'application/octet-stream',upsert:true});if(storageErr)console.warn('Storage upload failed (non-fatal):',storageErr.message);item.progress=85;renderUploadProgress();await sb.from('audit_log').insert({id:uuidv4(),user_id:currentUser.id,node_id:id,action:'version_create',details:{version_number:1,size}});item.progress=100;renderUploadProgress();}
 (window as any).triggerUpload=()=>{(document.getElementById('file-input') as HTMLInputElement).click();};
 (window as any).createFolder=async()=>{
@@ -1706,7 +1674,18 @@ function fileIcon(mime:string|null):string{if(!mime)return'&#128196;';if(mime.st
 function fileIconCls(mime:string|null):string{if(!mime)return'file';if(mime.startsWith('image/'))return'img';if(mime.includes('pdf')||mime.includes('word')||mime.includes('doc'))return'doc';return'file';}
 function errMsg(msg:string):string{return`<div class="empty"><div class="empty-ic">&#9888;</div><div class="empty-t">Ошибка</div><div class="empty-d">${esc(msg)}</div></div>`;}
 function updateBreadcrumbView(name:string){document.getElementById('bc')!.innerHTML=`<a>${t.vault}</a><span class="sep">/</span><a>${name}</a>`;}
-function toast(msg:string,type:'ok'|'err'){const c=document.getElementById('toasts')!;const d=document.createElement('div');d.className=`toast ${type}`;d.innerHTML=`<span>${type==='ok'?'&#10003;':'&#10007;'}</span> ${msg}`;c.appendChild(d);setTimeout(()=>{d.style.opacity='0';d.style.transform='translateX(100%)';d.style.transition='all .2s';setTimeout(()=>d.remove(),200);},3000);}
+function toast(msg:string,type:'ok'|'err'){
+  const c=document.getElementById('toasts')!;
+  const d=document.createElement('div');
+  d.className=`toast ${type}`;
+  const icon=document.createElement('span');
+  icon.textContent=type==='ok'?'OK':'ERR';
+  const text=document.createElement('span');
+  text.textContent=` ${msg}`;
+  d.append(icon,text);
+  c.appendChild(d);
+  setTimeout(()=>{d.style.opacity='0';d.style.transform='translateX(100%)';d.style.transition='all .2s';setTimeout(()=>d.remove(),200);},3000);
+}
 
 // --- Theme toggle ---
 function applyTheme(theme: string) {
