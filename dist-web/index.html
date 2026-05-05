@@ -318,11 +318,32 @@
     /* Section headers */
     .section-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
     .section-title{font-size:15px;font-weight:700;color:var(--text-0)}
+    .launchpad{max-width:1180px;margin:8px auto 0;display:grid;grid-template-columns:minmax(0,1.6fr) minmax(280px,0.9fr);gap:16px;align-items:start}
+    .launch-card{background:linear-gradient(180deg,var(--bg-1),var(--bg-2));border:1px solid var(--border);border-radius:var(--r-xl);padding:20px;box-shadow:var(--shadow)}
+    .launch-kicker{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.14em;color:var(--accent);margin-bottom:8px}
+    .launch-hero{font-size:30px;line-height:1;font-weight:800;letter-spacing:-0.04em;color:var(--text-0);max-width:10ch}
+    .launch-copy{margin-top:12px;font-size:13px;color:var(--text-2);max-width:60ch}
+    .launch-tabs{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}
+    .launch-tab{padding:6px 10px;border-radius:999px;border:1px solid var(--border);background:var(--bg-1);color:var(--text-2);font-size:11px;font-weight:600}
+    .launch-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:16px}
+    .launch-item{padding:12px;border-radius:var(--r-lg);background:var(--bg-1);border:1px solid var(--border)}
+    .launch-item strong{display:block;font-size:12px;color:var(--accent);margin-bottom:6px}
+    .launch-item h4{font-size:13px;line-height:1.2;margin-bottom:4px;color:var(--text-0)}
+    .launch-item p{font-size:11px;line-height:1.4;color:var(--text-2)}
+    .launch-side{display:flex;flex-direction:column;gap:12px}
+    .launch-side .launch-card{padding:18px}
+    .launch-list{display:grid;gap:8px;margin-top:12px}
+    .launch-list .row{display:flex;align-items:flex-start;gap:10px;padding:10px 12px;border-radius:var(--r-lg);background:var(--bg-1);border:1px solid var(--border)}
+    .launch-list .dot{width:8px;height:8px;border-radius:999px;background:var(--accent);margin-top:5px;flex-shrink:0}
+    .launch-list .meta{font-size:11px;color:var(--text-2)}
+    .launch-cta{margin-top:14px;display:flex;gap:8px;flex-wrap:wrap}
+    .launch-cta button{border:none}
 
     @media(max-width:900px){.sidebar{width:48px}.sidebar .nav-label,.sidebar .logo span,.sidebar .nav-btn span:not(.ic),.sidebar .user-avatar,.sidebar-foot{display:none}.sidebar .nav-btn{justify-content:center;padding:8px}.sidebar .logo{justify-content:center}.tree-panel{display:none}.detail{width:280px}}
+    @media(max-width:1100px){.launchpad{grid-template-columns:1fr}.launch-grid{grid-template-columns:1fr}}
     @media(max-width:640px){.sidebar{display:none}.file-row .fr-date{display:none}.detail{position:fixed;right:0;top:0;bottom:0;width:100%;z-index:50}.search-box{display:none}}
   </style>
-  <script type="module" crossorigin src="/assets/index-DNA811w4.js"></script>
+  <script type="module" crossorigin src="./assets/index-yF-RDTPg.js"></script>
 </head>
 <body>
 <div class="app" id="app">
@@ -345,7 +366,61 @@
       <button class="btn-sm" id="theme-toggle" onclick="toggleTheme()" title="Сменить тему">&#9790;</button>
     </div>
     <div class="collab-bar" id="collab-bar" style="display:none"></div>
-    <div class="content" id="content"></div>
+    <div class="content" id="content">
+      <div class="launchpad">
+        <div class="launch-card">
+          <div class="launch-kicker">Live Preview</div>
+          <div class="launch-hero">Vault PLM</div>
+          <div class="launch-copy">
+            Мы собираем десктопный DMS/PLM shell с файловым workflow, карточками изделий и совместной работой.
+            Здесь будет видно, что мы делаем, даже если backend еще не подключен.
+          </div>
+          <div class="launch-tabs">
+            <div class="launch-tab">Desktop UX</div>
+            <div class="launch-tab">File Workflow</div>
+            <div class="launch-tab">PLM Block</div>
+            <div class="launch-tab">Collaboration</div>
+          </div>
+          <div class="launch-grid">
+            <div class="launch-item">
+              <strong>01</strong>
+              <h4>Desktop UX</h4>
+              <p>Меню, окно, горячие клавиши, запуск и визуальный статус приложения.</p>
+            </div>
+            <div class="launch-item">
+              <strong>02</strong>
+              <h4>File workflow</h4>
+              <p>Upload, preview, rename, move, delete и навигация по папкам.</p>
+            </div>
+            <div class="launch-item">
+              <strong>03</strong>
+              <h4>PLM block</h4>
+              <p>Карточки изделий, BOM, lifecycle и маршруты согласования.</p>
+            </div>
+          </div>
+          <div class="launch-cta">
+            <button class="btn-sm primary" onclick="document.getElementById('theme-toggle').click()">Переключить тему</button>
+            <button class="btn-sm" onclick="location.reload()">Перезагрузить</button>
+          </div>
+        </div>
+        <div class="launch-side">
+          <div class="launch-card">
+            <div class="section-header"><div class="section-title">Что уже готово</div></div>
+            <div class="launch-list">
+              <div class="row"><span class="dot"></span><div><div class="meta">Electron app запускается как desktop-окно</div></div></div>
+              <div class="row"><span class="dot"></span><div><div class="meta">Есть shell для файлов, PLM и collaboration</div></div></div>
+              <div class="row"><span class="dot"></span><div><div class="meta">Сейчас добиваем стартовый экран и рабочий поток</div></div></div>
+            </div>
+          </div>
+          <div class="launch-card">
+            <div class="section-header"><div class="section-title">Следующий шаг</div></div>
+            <div class="launch-copy" style="margin-top:0">
+              Подключим настоящий рабочий экран файлов и сделаем tabs/панели более живыми.
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
   <div class="detail" id="detail" style="display:none"></div>
 </div>
