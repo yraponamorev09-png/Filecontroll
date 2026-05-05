@@ -1159,6 +1159,43 @@ async function loadFiles(parentId:string|null) {
     <div id="virtual-sentinel" style="height:1px"></div>`;
   setupDropZone();bindFileRows();
   if (nodes.length > 50) setupVirtualScroll(nodes);
+  if (currentView === 'files' && !selectedNodeId) {
+    renderFilesOverview(nodes, parentId);
+  }
+}
+
+function renderFilesOverview(nodes: any[], parentId: string | null) {
+  const panel = document.getElementById('detail');
+  if (!panel) return;
+  const folders = nodes.filter((n: any) => n.node_type === 'folder').length;
+  const files = nodes.filter((n: any) => n.node_type === 'file').length;
+  const size = nodes.reduce((acc: number, n: any) => acc + (n.node_type === 'file' ? (n.size || 0) : 0), 0);
+  const title = parentId ? `Папка: ${pathStack[pathStack.length - 1]?.name || 'Хранилище'}` : 'Хранилище';
+  panel.style.display = 'flex';
+  panel.innerHTML = `
+    <div class="detail-head">
+      <div class="detail-name">${esc(title)}</div>
+      <div class="detail-sub">Рабочая область файлов</div>
+    </div>
+    <div class="detail-sec">
+      <div class="detail-sec-title">Сводка</div>
+      <div class="stats" style="grid-template-columns:1fr 1fr 1fr">
+        <div class="stat-card" style="padding:10px 12px"><div class="stat-val">${folders}</div><div class="stat-lbl">${t.folders}</div></div>
+        <div class="stat-card" style="padding:10px 12px"><div class="stat-val">${files}</div><div class="stat-lbl">${t.files}</div></div>
+        <div class="stat-card" style="padding:10px 12px"><div class="stat-val" style="font-size:17px">${fmtSize(size)}</div><div class="stat-lbl">${t.total_size}</div></div>
+      </div>
+    </div>
+    <div class="detail-sec">
+      <div class="detail-sec-title">Действия</div>
+      <div class="startup-actions" style="margin-top:0">
+        <button class="btn-sm primary" onclick="triggerUpload()">Загрузить</button>
+        <button class="btn-sm" onclick="createFolder()">Новая папка</button>
+      </div>
+    </div>
+    <div class="detail-sec">
+      <div class="detail-sec-title">Подсказка</div>
+      <div style="font-size:12px;color:var(--text-2)">Выберите файл, чтобы открыть preview и свойства. Перетащите файл в папку, чтобы переместить его.</div>
+    </div>`;
 }
 
 async function openFolder(folderId: string, folderName: string) {
