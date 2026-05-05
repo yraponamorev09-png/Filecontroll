@@ -1,8 +1,50 @@
 const { app, BrowserWindow, Menu, shell } = require('electron');
+const fs = require('fs');
 const path = require('path');
+
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+}
 
 let mainWindow;
 let isDev = false;
+let windowState = { width: 1400, height: 900, x: undefined, y: undefined, maximized: false };
+const windowStatePath = () => path.join(app.getPath('userData'), 'window-state.json');
+
+function readWindowState() {
+  try {
+    const raw = fs.readFileSync(windowStatePath(), 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object') {
+      windowState = {
+        width: Number.isFinite(parsed.width) ? parsed.width : 1400,
+        height: Number.isFinite(parsed.height) ? parsed.height : 900,
+        x: Number.isFinite(parsed.x) ? parsed.x : undefined,
+        y: Number.isFinite(parsed.y) ? parsed.y : undefined,
+        maximized: !!parsed.maximized,
+      };
+    }
+  } catch {
+    windowState = { width: 1400, height: 900, x: undefined, y: undefined, maximized: false };
+  }
+}
+
+function saveWindowState() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const bounds = mainWindow.getBounds();
+  const payload = {
+    width: bounds.width,
+    height: bounds.height,
+    x: bounds.x,
+    y: bounds.y,
+    maximized: mainWindow.isMaximized(),
+  };
+  try {
+    fs.writeFileSync(windowStatePath(), JSON.stringify(payload, null, 2));
+  } catch {
+    // Ignore persistence failures; startup should still work.
+  }
+}
 
 function sendMenuAction(action) {
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -11,11 +53,14 @@ function sendMenuAction(action) {
 }
 
 function createWindow() {
+  readWindowState();
   mainWindow = new BrowserWindow({
-    width: 1400,
-    height: 900,
+    width: windowState.width,
+    height: windowState.height,
     minWidth: 800,
     minHeight: 600,
+    x: windowState.x,
+    y: windowState.y,
     title: 'Vault DMS',
     show: false,
     backgroundColor: '#0a0b10',
@@ -39,10 +84,17 @@ function createWindow() {
 
   mainWindow.once('ready-to-show', () => {
     if (!mainWindow.isDestroyed()) {
+      if (windowState.maximized) mainWindow.maximize();
       mainWindow.show();
       mainWindow.focus();
     }
   });
+
+  mainWindow.on('resize', saveWindowState);
+  mainWindow.on('move', saveWindowState);
+  mainWindow.on('maximize', saveWindowState);
+  mainWindow.on('unmaximize', saveWindowState);
+  mainWindow.on('close', saveWindowState);
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith('http://') || url.startsWith('https://')) {
@@ -111,6 +163,14 @@ function createWindow() {
 }
 
 app.whenReady().then(createWindow);
+
+app.on('second-instance', () => {
+  if (mainWindow) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  }
+});
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
