@@ -774,7 +774,7 @@ function showContextMenu(row:HTMLElement,x:number,y:number) {
   menu.innerHTML=items;document.body.appendChild(menu);ctxMenuEl=menu;
   menu.querySelectorAll('.ctx-item').forEach(item=>{item.addEventListener('click',()=>{
     const action=(item as HTMLElement).dataset.action!,id=(item as HTMLElement).dataset.id!;closeCtxMenu();
-    switch(action){case 'open':pathStack.push({id,name});currentParentId=id;loadFiles(id);break;case 'info':openDetail(id);break;case 'preview':previewFile(id);break;case 'download':(window as any).downloadFile(id);break;case 'rename':startRename(id);break;case 'archive':(window as any).archiveFile(id);break;case 'move':openMoveModal(id);break;case 'delete':(window as any).deleteFile(id);break;}
+    switch(action){case 'open':openFolder(id,name);break;case 'info':openDetail(id);break;case 'preview':previewFile(id);break;case 'download':(window as any).downloadFile(id);break;case 'rename':startRename(id);break;case 'archive':(window as any).archiveFile(id);break;case 'move':openMoveModal(id);break;case 'delete':(window as any).deleteFile(id);break;}
   });});
 }
 function closeCtxMenu(){if(ctxMenuEl){ctxMenuEl.remove();ctxMenuEl=null;}}
@@ -1107,6 +1107,23 @@ async function loadFiles(parentId:string|null) {
   if (nodes.length > 50) setupVirtualScroll(nodes);
 }
 
+async function openFolder(folderId: string, folderName: string) {
+  if (!folderId) return;
+  setEditingNode(null);
+  const last = pathStack[pathStack.length - 1];
+  if (!last || last.id !== folderId) {
+    pathStack.push({ id: folderId, name: folderName });
+  }
+  currentParentId = folderId;
+  (document.getElementById('btn-back') as HTMLElement).style.display = 'flex';
+  showLoading(`Открытие: ${folderName}`);
+  try {
+    await loadFiles(folderId);
+  } finally {
+    hideLoading();
+  }
+}
+
 function fileRow(n:any):string {
   const ic=n.node_type==='folder'?'&#128193;':fileIcon(n.mime_type);
   const icCls=n.node_type==='folder'?'folder':fileIconCls(n.mime_type);
@@ -1161,8 +1178,8 @@ function bindFileRows() {
       (r as HTMLElement).classList.remove('dragging');
       document.querySelectorAll('.drop-target').forEach(el=>el.classList.remove('drop-target'));
     });
-    r.addEventListener('click',()=>{const id=(r as HTMLElement).dataset.id!,type=(r as HTMLElement).dataset.type!;if(type==='folder'){setEditingNode(null);const name=r.querySelector('.fr-name')!.textContent!;pathStack.push({id,name});currentParentId=id;(document.getElementById('btn-back') as HTMLElement).style.display='flex';loadFiles(id);}else{document.querySelectorAll('.file-row.selected').forEach(x=>x.classList.remove('selected'));r.classList.add('selected');openDetail(id);}});
-    r.addEventListener('dblclick',()=>{const type=(r as HTMLElement).dataset.type!;if(type==='file')previewFile((r as HTMLElement).dataset.id!);});
+    r.addEventListener('click',async()=>{const id=(r as HTMLElement).dataset.id!,type=(r as HTMLElement).dataset.type!;if(type==='folder'){const name=r.querySelector('.fr-name')!.textContent!;await openFolder(id,name);}else{document.querySelectorAll('.file-row.selected').forEach(x=>x.classList.remove('selected'));r.classList.add('selected');openDetail(id);}});
+    r.addEventListener('dblclick',async()=>{const id=(r as HTMLElement).dataset.id!,type=(r as HTMLElement).dataset.type!;if(type==='file')previewFile(id);else{const name=r.querySelector('.fr-name')!.textContent!;await openFolder(id,name);}});
   });
   // Make folder rows drop targets
   document.querySelectorAll('.file-row[data-type="folder"]').forEach(f=>{
