@@ -14,6 +14,7 @@ import {
   joinEditingChannel, broadcastEditingState, broadcastEditingCursor, leaveEditingChannel,
 } from '../utils/realtime.ts';
 import { cacheGet, cacheSet, cacheInvalidate, cacheClear, dedupFetch } from '../utils/cache.ts';
+import { createDemoRuntime } from './demo-store.ts';
 
 // --- Supabase client (uses .env, auth is handled by Supabase Auth) ---
 const SUPABASE_URL = (import.meta as any).env?.VITE_SUPABASE_URL ?? '';
@@ -33,6 +34,7 @@ let selectedNodeId: string | null = null;
 let selectedProductId: string | null = null;
 let currentView = 'files';
 let currentUser: any = null; // auth.users + user_profiles merged
+let demoMode = false;
 let pathStack: { id: string | null; name: string }[] = [{ id: null, name: 'Хранилище' }];
 let uploadQueue: { file: File; progress: number }[] = [];
 let isUploading = false;
@@ -183,7 +185,8 @@ function setupDesktopBridge() {
   const platform = desktopBridge?.platform || '';
   if (statusEl) {
     statusEl.style.display = 'inline-flex';
-    statusEl.textContent = [version ? `v${version}` : '', platform].filter(Boolean).join(' · ');
+    const parts = [demoMode ? 'demo' : '', version ? `v${version}` : '', platform].filter(Boolean);
+    statusEl.textContent = parts.join(' · ');
   }
   document.body.dataset.desktop = 'true';
   document.title = version ? `Vault PLM v${version}` : 'Vault PLM';
@@ -205,17 +208,28 @@ function setupDesktopBridge() {
 async function bootstrapWorkspace() {
   showLoading('Подготовка рабочего пространства...');
   try {
-    await seedIfEmpty();
+    if (!demoMode) {
+      await seedIfEmpty();
+    }
     renderNav();
     loadTree();
     setupSearch();
     setupKeyboard();
     setupGlobalClicks();
-    loadView('products');
+    loadView(demoMode ? 'files' : 'products');
     setupRealtimeSubscriptions();
   } finally {
     hideLoading();
   }
+}
+
+async function startDemoWorkspace() {
+  demoMode = true;
+  const demo = createDemoRuntime();
+  sb = demo.client as any;
+  auth = demo.auth as any;
+  currentUser = demo.user;
+  await bootstrapWorkspace();
 }
 
 async function hashFileInBackground(buf: ArrayBuffer): Promise<string> {
@@ -292,8 +306,12 @@ async function ensureFolderChildrenCached(parentKey: string, dbParentId: string 
 
 // --- Init ---
 async function init() {
+  demoMode = !SUPABASE_URL || !SUPABASE_ANON_KEY;
   setupDesktopBridge();
-  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) { showConnectionSetup(); return; }
+  if (demoMode) {
+    await startDemoWorkspace();
+    return;
+  }
   sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
   auth = new AuthService(sb);
   showLoading('Запуск Vault PLM...');
@@ -435,10 +453,13 @@ function showConnectionSetup() {
     <div style="max-width:480px;margin:60px auto;background:var(--bg-1);border:1px solid var(--border);border-radius:var(--r-xl);padding:24px">
       <div style="font-size:16px;font-weight:700;margin-bottom:4px">Vault PLM</div>
       <div style="font-size:12px;color:var(--text-2);margin-bottom:16px">Настройте подключение к базе данных для начала работы</div>
+      <div style="display:flex;gap:8px;margin-bottom:16px">
+        <button class="btn-sm primary" style="flex:1;justify-content:center" onclick="completeSetup()">Подключиться</button>
+        <button class="btn-sm" style="flex:1;justify-content:center" onclick="startDemoWorkspace()">Demo workspace</button>
+      </div>
       <div class="fg"><label>URL базы данных (Supabase)</label><input id="setup-url" placeholder="https://xxx.supabase.co" /></div>
       <div class="fg"><label>Ключ доступа (anon key)</label><input id="setup-key" type="password" placeholder="eyJ..." /></div>
       <div class="fg"><label>Сервисный ключ (service_role_key, опционально)</label><input id="setup-skey" type="password" placeholder="eyJ..." /></div>
-      <button class="btn-sm primary" style="width:100%;justify-content:center" onclick="completeSetup()">Подключиться</button>
     </div>`;
 }
 
@@ -504,9 +525,11 @@ function showConnectionSetup() {
 
 (window as any).handleLogout = async () => {
   await setEditingNode(null);
-  unsubscribeAll(sb);
-  leavePresence(sb);
-  leaveEditingChannel(sb);
+  if (!demoMode) {
+    unsubscribeAll(sb);
+    leavePresence(sb);
+    leaveEditingChannel(sb);
+  }
   realtimeSetup = false;
   editingStates = {};
   presenceUsers = [];
@@ -516,9 +539,13 @@ function showConnectionSetup() {
   cursorStates = {};
   treeFoldersByParent = {};
   cacheClear();
-  await auth.signOut();
   currentUser = null;
-  showLoginScreen();
+  if (demoMode) {
+    showConnectionSetup();
+  } else {
+    await auth.signOut();
+    showLoginScreen();
+  }
 };
 
 (window as any).completeSetup = async () => {
@@ -533,6 +560,8 @@ function showConnectionSetup() {
     showLoginScreen();
   } catch (e: any) { toast(t.connection_failed + ': ' + e.message,'err'); }
 };
+
+(window as any).startDemoWorkspace = startDemoWorkspace;
 
 function generateDemoContent(name: string, mime: string, size: number): Blob {
   if (mime.startsWith('image/')) {
@@ -564,6 +593,7 @@ function generateDemoContent(name: string, mime: string, size: number): Blob {
 }
 
 async function seedIfEmpty() {
+  if (demoMode) return;
   const { count } = await sb.from('nodes').select('*',{count:'exact',head:true}).eq('is_deleted',false);
   if (count && count > 0) return;
   const uid = currentUser.id;
@@ -604,7 +634,21 @@ async function seedIfEmpty() {
 // --- Nav ---
 function renderNav() {
   const nav = document.getElementById('nav')!;
-  nav.innerHTML = `
+  nav.innerHTML = demoMode ? `
+    <div class="nav-group"><div class="nav-label">${t.nav}</div>
+      <button class="nav-btn active" data-v="files"><span class="ic">&#128193;</span>${t.all_files}</button>
+      <button class="nav-btn" data-v="recent"><span class="ic">&#128337;</span>${t.recent}</button>
+      <button class="nav-btn" data-v="shared"><span class="ic">&#128279;</span>${t.shared}</button>
+      <button class="nav-btn" data-v="archived"><span class="ic">&#128230;</span>${t.archive}</button>
+      <button class="nav-btn" data-v="trash"><span class="ic">&#128465;</span>${t.trash}</button>
+    </div>
+    <div class="nav-group"><div class="nav-label">${t.manage}</div>
+      <button class="nav-btn" data-v="analytics"><span class="ic">&#128200;</span>${t.analytics}</button>
+      <button class="nav-btn" data-v="audit"><span class="ic">&#128203;</span>${t.audit}</button>
+      <button class="nav-btn" data-v="blocks"><span class="ic">&#128336;</span>${t.storage}</button>
+    </div>
+    <div style="padding:6px;border-top:1px solid var(--border)"><button class="nav-btn" style="color:var(--red)" onclick="handleLogout()"><span class="ic">&#10140;</span>${t.sign_out}</button></div>`
+  : `
     <div class="nav-group"><div class="nav-label">${t.nav}</div>
       <button class="nav-btn active" data-v="products"><span class="ic">&#9881;</span>${t.products}</button>
       <button class="nav-btn" data-v="files"><span class="ic">&#128193;</span>${t.all_files}</button>
@@ -629,6 +673,9 @@ function renderNav() {
 }
 
 function loadView(view: string) {
+  if (demoMode && !['files','recent','shared','archived','trash','analytics','audit','blocks'].includes(view)) {
+    view = 'files';
+  }
   currentView = view;
   document.querySelectorAll('.nav-btn').forEach(b => b.classList.toggle('active',(b as HTMLElement).dataset.v===view));
   document.getElementById('detail')!.style.display='none';
@@ -797,53 +844,57 @@ async function previewFile(nodeId:string) {
   const {data:node}=await sb.from('nodes').select('*').eq('id',nodeId).maybeSingle();if(!node)return;
   const ext=(node.name.split('.').pop()||'').toLowerCase();
   const existing=document.getElementById('preview-panel');if(existing)existing.remove();
-
   const panel=document.createElement('div');panel.className='preview-panel';panel.id='preview-panel';
   panel.innerHTML=`<div class="preview-content"><div class="preview-head"><div class="preview-title">${esc(node.name)}</div><div style="display:flex;gap:4px"><button class="btn-sm primary" onclick="downloadFile('${nodeId}')">&#11015; Скачать</button><button class="btn-sm" onclick="closePreview()">Закрыть</button></div></div><div class="preview-body" style="align-items:center;justify-content:center"><div class="loading-spinner"></div></div></div>`;
   document.body.appendChild(panel);panel.addEventListener('click',(e)=>{if(e.target===panel)closePreview();});
-
   const isImage=node.mime_type?.startsWith('image/');
   const isPdf=node.mime_type?.includes('pdf');
   const isText=node.mime_type?.startsWith('text/')||['md','txt','csv','json','xml','yaml','yml','log','cfg','ini','sh','bat','py','js','ts','css','html','sql'].includes(ext);
   const isAudio=node.mime_type?.startsWith('audio/');
   const isVideo=node.mime_type?.startsWith('video/');
-
   let body='';
   try {
-    const h = await vaultHeaders();
-    const res = await fetch(`${VAULT_API}/files/content?node_id=${nodeId}`, { headers: h });
-    const data = await res.json();
-
-    if (data.url) {
-      if (isImage) {
-        body=`<img src="${data.url}" alt="${esc(node.name)}" style="max-width:100%;max-height:100%;object-fit:contain" />`;
-      } else if (isPdf) {
-        body=`<iframe src="${data.url}" style="width:100%;height:100%;border:none"></iframe>`;
-      } else if (isAudio) {
-        body=`<div style="text-align:center;padding:40px"><div style="font-size:48px;opacity:0.3">&#127925;</div><audio controls src="${data.url}" style="margin-top:16px;width:80%;max-width:400px"><a href="${data.url}">Скачать аудио</a></audio><div style="margin-top:8px;font-size:11px;color:var(--text-3)">${esc(node.name)} &middot; ${fmtSize(node.size)}</div></div>`;
-      } else if (isVideo) {
-        body=`<video controls src="${data.url}" style="max-width:100%;max-height:100%"><a href="${data.url}">Скачать видео</a></video>`;
-      } else if (isText) {
-        // Fetch text content and display it
-        try {
-          const textRes = await fetch(data.url);
-          const text = await textRes.text();
-          const escaped = text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-          body=`<pre style="width:100%;font-size:12px;color:var(--text-1);white-space:pre-wrap;word-break:break-word;font-family:'IBM Plex Mono',monospace;overflow:auto;max-height:100%;padding:16px;background:var(--bg-1);border:1px solid var(--border);border-radius:var(--r-lg)">${escaped}</pre>`;
-        } catch {
-          body=`<div class="preview-file-info"><div class="preview-icon">&#128196;</div><div class="preview-filename">${esc(node.name)}</div><div class="preview-meta">${esc(node.mime_type)} &middot; ${fmtSize(node.size)}</div><div style="margin-top:12px"><a href="${data.url}" target="_blank" class="btn-sm primary">&#11015; Скачать</a></div></div>`;
-        }
+    if (demoMode) {
+      const blob = generateDemoContent(node.name, node.mime_type || 'application/octet-stream', node.size || 0);
+      const url = URL.createObjectURL(blob);
+      if (isImage) body=`<img src="${url}" alt="${esc(node.name)}" style="max-width:100%;max-height:100%;object-fit:contain" />`;
+      else if (isPdf) body=`<iframe src="${url}" style="width:100%;height:100%;border:none"></iframe>`;
+      else if (isAudio) body=`<div style="text-align:center;padding:40px"><div style="font-size:48px;opacity:0.3">&#127925;</div><audio controls src="${url}" style="margin-top:16px;width:80%;max-width:400px"><a href="${url}">Скачать аудио</a></audio><div style="margin-top:8px;font-size:11px;color:var(--text-3)">${esc(node.name)} &middot; ${fmtSize(node.size)}</div></div>`;
+      else if (isVideo) body=`<video controls src="${url}" style="max-width:100%;max-height:100%"><a href="${url}">Скачать видео</a></video>`;
+      else if (isText) {
+        const text = await (await fetch(url)).text();
+        const escaped = text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        body=`<pre style="width:100%;font-size:12px;color:var(--text-1);white-space:pre-wrap;word-break:break-word;font-family:'IBM Plex Mono',monospace;overflow:auto;max-height:100%;padding:16px;background:var(--bg-1);border:1px solid var(--border);border-radius:var(--r-lg)">${escaped}</pre>`;
       } else {
-        body=`<div class="preview-file-info"><div class="preview-icon">&#128196;</div><div class="preview-filename">${esc(node.name)}</div><div class="preview-meta">${esc(node.mime_type||'Неизвестный тип')} &middot; ${fmtSize(node.size)}</div><div style="margin-top:12px"><a href="${data.url}" target="_blank" class="btn-sm primary">&#11015; Скачать файл</a></div></div>`;
+        body=`<div class="preview-file-info"><div class="preview-icon">&#128196;</div><div class="preview-filename">${esc(node.name)}</div><div class="preview-meta">${esc(node.mime_type||'Неизвестный тип')} &middot; ${fmtSize(node.size)}</div><div style="margin-top:12px"><a href="${url}" target="_blank" class="btn-sm primary">&#11015; Скачать файл</a></div></div>`;
       }
     } else {
-      // No content in storage - show metadata-only view
-      body=`<div class="preview-file-info"><div class="preview-icon">${isImage?'&#128444;':isPdf?'&#128213;':'&#128196;'}</div><div class="preview-filename">${esc(node.name)}</div><div class="preview-meta">${esc(node.mime_type||'?')} &middot; ${fmtSize(node.size)}</div><div style="margin-top:12px;color:var(--text-3);font-size:11px">Файл ещё не загружен в хранилище. Скачайте для просмотра.</div></div>`;
+      const h = await vaultHeaders();
+      const res = await fetch(`${VAULT_API}/files/content?node_id=${nodeId}`, { headers: h });
+      const data = await res.json();
+      if (data.url) {
+        if (isImage) body=`<img src="${data.url}" alt="${esc(node.name)}" style="max-width:100%;max-height:100%;object-fit:contain" />`;
+        else if (isPdf) body=`<iframe src="${data.url}" style="width:100%;height:100%;border:none"></iframe>`;
+        else if (isAudio) body=`<div style="text-align:center;padding:40px"><div style="font-size:48px;opacity:0.3">&#127925;</div><audio controls src="${data.url}" style="margin-top:16px;width:80%;max-width:400px"><a href="${data.url}">Скачать аудио</a></audio><div style="margin-top:8px;font-size:11px;color:var(--text-3)">${esc(node.name)} &middot; ${fmtSize(node.size)}</div></div>`;
+        else if (isVideo) body=`<video controls src="${data.url}" style="max-width:100%;max-height:100%"><a href="${data.url}">Скачать видео</a></video>`;
+        else if (isText) {
+          try {
+            const text = await (await fetch(data.url)).text();
+            const escaped = text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+            body=`<pre style="width:100%;font-size:12px;color:var(--text-1);white-space:pre-wrap;word-break:break-word;font-family:'IBM Plex Mono',monospace;overflow:auto;max-height:100%;padding:16px;background:var(--bg-1);border:1px solid var(--border);border-radius:var(--r-lg)">${escaped}</pre>`;
+          } catch {
+            body=`<div class="preview-file-info"><div class="preview-icon">&#128196;</div><div class="preview-filename">${esc(node.name)}</div><div class="preview-meta">${esc(node.mime_type)} &middot; ${fmtSize(node.size)}</div><div style="margin-top:12px"><a href="${data.url}" target="_blank" class="btn-sm primary">&#11015; Скачать</a></div></div>`;
+          }
+        } else {
+          body=`<div class="preview-file-info"><div class="preview-icon">&#128196;</div><div class="preview-filename">${esc(node.name)}</div><div class="preview-meta">${esc(node.mime_type||'Неизвестный тип')} &middot; ${fmtSize(node.size)}</div><div style="margin-top:12px"><a href="${data.url}" target="_blank" class="btn-sm primary">&#11015; Скачать файл</a></div></div>`;
+        }
+      } else {
+        body=`<div class="preview-file-info"><div class="preview-icon">${isImage?'&#128444;':isPdf?'&#128213;':'&#128196;'}</div><div class="preview-filename">${esc(node.name)}</div><div class="preview-meta">${esc(node.mime_type||'?')} &middot; ${fmtSize(node.size)}</div><div style="margin-top:12px;color:var(--text-3);font-size:11px">Файл ещё не загружен в хранилище. Скачайте для просмотра.</div></div>`;
+      }
     }
   } catch(e: any) {
     body=`<div class="preview-file-info"><div class="preview-icon">&#9888;</div><div class="preview-filename">${esc(node.name)}</div><div class="preview-meta" style="color:var(--red)">${esc(e.message||'Ошибка загрузки')}</div></div>`;
   }
-
   const bodyEl=panel.querySelector('.preview-body');
   if(bodyEl){bodyEl.style.alignItems='flex-start';bodyEl.style.justifyContent='flex-start';bodyEl.innerHTML=body;}
 }
@@ -852,6 +903,7 @@ function closePreview(){const p=document.getElementById('preview-panel');if(p)p.
 
 // --- Supabase Realtime: списки + presence (без polling) ---
 function setupRealtimeSubscriptions() {
+  if (demoMode) return;
   if (!realtimeSetup && currentUser) {
     realtimeSetup = true;
     joinPresence(sb, currentUser.id, { email: currentUser.email || '', fullName: currentUser.full_name || '' }, (users) => {
@@ -1329,6 +1381,13 @@ async function openDetail(nodeId:string) {
 (window as any).unarchiveFileAction=async(nodeId:string)=>{try{await unarchiveFile(nodeId);invalidateNodesAndTreeCaches();toast(t.unarchive_btn,'ok');if(currentView==='archived')loadArchived();else if(currentView==='files')loadFiles(currentParentId);loadTree();}catch(e:any){toast(e.message,'err');}};
 (window as any).downloadFile=async(nodeId:string)=>{
   const{data:node}=await sb.from('nodes').select('name,mime_type').eq('id',nodeId).maybeSingle();if(!node)return;
+  if (demoMode) {
+    const blob = generateDemoContent(node.name, node.mime_type || 'application/octet-stream', 1024);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');a.href=url;a.download=node.name;a.click();
+    URL.revokeObjectURL(url);
+    return;
+  }
   try{
     const h=await vaultHeaders();
     const res=await fetch(`${VAULT_API}/files/content?node_id=${nodeId}`,{headers:h});
@@ -1574,6 +1633,13 @@ async function loadSecurity() {
 const VAULT_API = `${SUPABASE_URL}/functions/v1/vault`;
 /** Edge Function: JWT пользователя + apikey (не анонимный ключ как Bearer). */
 async function vaultHeaders(): Promise<Record<string, string>> {
+  if (demoMode) {
+    return {
+      Authorization: 'Bearer demo',
+      apikey: 'demo',
+      'Content-Type': 'application/json',
+    };
+  }
   const { data: { session } } = await sb.auth.getSession();
   const token = session?.access_token;
   if (!token) throw new Error('Нет сессии');
