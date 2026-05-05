@@ -1,5 +1,6 @@
 const { app, BrowserWindow, Menu, shell } = require('electron');
 const fs = require('fs');
+const http = require('http');
 const path = require('path');
 
 if (!app.requestSingleInstanceLock()) {
@@ -10,6 +11,8 @@ let mainWindow;
 let isDev = false;
 let windowState = { width: 1400, height: 900, x: undefined, y: undefined, maximized: false };
 const windowStatePath = () => path.join(app.getPath('userData'), 'window-state.json');
+const previewPort = 4173;
+let previewServer = null;
 
 function readWindowState() {
   try {
@@ -52,6 +55,51 @@ function sendMenuAction(action) {
   }
 }
 
+function servePreviewFile(rootDir, req, res) {
+  try {
+    const urlPath = decodeURIComponent((req.url || '/').split('?')[0]);
+    let filePath = path.join(rootDir, urlPath === '/' ? 'index.html' : urlPath);
+    if (!filePath.startsWith(rootDir)) {
+      res.writeHead(403);
+      res.end('Forbidden');
+      return;
+    }
+    if (fs.existsSync(filePath) && fs.statSync(filePath).isDirectory()) {
+      filePath = path.join(filePath, 'index.html');
+    }
+    if (!fs.existsSync(filePath)) {
+      filePath = path.join(rootDir, 'index.html');
+    }
+    const ext = path.extname(filePath).toLowerCase();
+    const mime = {
+      '.html': 'text/html; charset=utf-8',
+      '.js': 'text/javascript; charset=utf-8',
+      '.css': 'text/css; charset=utf-8',
+      '.json': 'application/json; charset=utf-8',
+      '.png': 'image/png',
+      '.svg': 'image/svg+xml',
+      '.ico': 'image/x-icon',
+      '.map': 'application/json; charset=utf-8',
+    }[ext] || 'application/octet-stream';
+    res.writeHead(200, { 'Content-Type': mime });
+    fs.createReadStream(filePath).pipe(res);
+  } catch (err) {
+    res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end(String(err?.message || err));
+  }
+}
+
+async function startPreviewServer() {
+  if (previewServer) return previewServer;
+  const rootDir = path.join(__dirname, '..', 'dist-web');
+  previewServer = http.createServer((req, res) => servePreviewFile(rootDir, req, res));
+  await new Promise((resolve, reject) => {
+    previewServer.once('error', reject);
+    previewServer.listen(previewPort, '127.0.0.1', resolve);
+  });
+  return previewServer;
+}
+
 function createWindow() {
   readWindowState();
   mainWindow = new BrowserWindow({
@@ -75,12 +123,9 @@ function createWindow() {
 
   isDev = process.env.NODE_ENV === 'development' || process.argv.includes('--dev');
 
-  if (isDev) {
-    mainWindow.loadURL('http://localhost:5173');
-    mainWindow.webContents.openDevTools();
-  } else {
-    mainWindow.loadFile(path.join(__dirname, '..', 'dist-web', 'index.html'));
-  }
+  const previewUrl = `http://127.0.0.1:${previewPort}/`;
+  mainWindow.loadURL(previewUrl);
+  if (isDev) mainWindow.webContents.openDevTools();
 
   mainWindow.once('ready-to-show', () => {
     if (!mainWindow.isDestroyed()) {
@@ -162,7 +207,10 @@ function createWindow() {
   Menu.setApplicationMenu(menu);
 }
 
-app.whenReady().then(createWindow);
+app.whenReady().then(async () => {
+  await startPreviewServer();
+  createWindow();
+});
 
 app.on('second-instance', () => {
   if (mainWindow) {
@@ -173,6 +221,10 @@ app.on('second-instance', () => {
 });
 
 app.on('window-all-closed', () => {
+  if (previewServer) {
+    try { previewServer.close(); } catch {}
+    previewServer = null;
+  }
   if (process.platform !== 'darwin') app.quit();
 });
 
