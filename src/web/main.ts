@@ -18,8 +18,8 @@ import { cacheGet, cacheSet, cacheInvalidate, cacheClear, dedupFetch } from '../
 // --- Supabase client (uses .env, auth is handled by Supabase Auth) ---
 const SUPABASE_URL = (import.meta as any).env?.VITE_SUPABASE_URL ?? '';
 const SUPABASE_ANON_KEY = (import.meta as any).env?.VITE_SUPABASE_ANON_KEY ?? '';
-const sb: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-const auth = new AuthService(sb);
+let sb!: SupabaseClient;
+let auth!: AuthService;
 
 // --- HTML escaping (XSS prevention) ---
 function esc(s: string | null | undefined): string {
@@ -294,6 +294,8 @@ async function ensureFolderChildrenCached(parentKey: string, dbParentId: string 
 async function init() {
   setupDesktopBridge();
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) { showConnectionSetup(); return; }
+  sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+  auth = new AuthService(sb);
   showLoading('Запуск Vault PLM...');
   try {
     updateLoading('Подключение к хранилищу...');

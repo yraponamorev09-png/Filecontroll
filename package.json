@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "vite --configLoader native --config vite.config.mjs",
     "build": "vite build --configLoader native --config vite.config.mjs",
     "start": "npm run build && electron .",
     "demo": "node --no-warnings --experimental-transform-types src/main.ts",
